@@ -20,6 +20,7 @@ import {
   TUNNEL_TOKEN,
   API_TOKEN,
   RELAY_PRIVATE_KEY,
+  AIPASS_TOKEN_BUNDLE,
 } from "./secrets.ts";
 import { publicKeyFor } from "./relay.ts";
 
@@ -77,6 +78,7 @@ export interface RelayConfig {
  * by `hydrateSecrets()` and stripped again by `saveConfig()`.
  */
 export type AiProviderId =
+  | "aipass"
   | "anthropic"
   | "openai"
   | "gemini"
@@ -96,7 +98,9 @@ export interface AiCatalogEntry {
   /** The console/key-management URL (without "https://") shown as a link. */
   url: string;
   /** API-key format hint shown in the password input placeholder. */
-  keyPlaceholder: string;
+  keyPlaceholder?: string;
+  /** AI Pass is connected as an OAuth account, not configured with an API key. */
+  accountConnection?: boolean;
   /** True when the provider offers a free tier (shows a "Free tier available" badge — this means
    *  the vendor's API has a free usage tier, NOT that a key is present or that only the free tier
    *  is supported; it's a signpost to a zero-cost option). */
@@ -120,6 +124,7 @@ export interface AiCatalogEntry {
  * Order = display order in the Settings UI (free providers first).
  */
 export const AI_CATALOG: readonly AiCatalogEntry[] = [
+  { id: "aipass",      label: "AI Pass",   url: "aipass.one",                 accountConnection: true },
   { id: "groq",       label: "Groq",      url: "console.groq.com/keys",    keyPlaceholder: "gsk_…",     free: true, suggested: true, recommended: "llama-3.3-70b-versatile" },
   { id: "openrouter", label: "OpenRouter", url: "openrouter.ai/keys",       keyPlaceholder: "sk-or-…",   free: true, recommended: "meta-llama/llama-3.3-70b-instruct:free" },
   { id: "gemini",     label: "Gemini",     url: "aistudio.google.com",      keyPlaceholder: "AIza…",     free: true, recommended: "gemini-2.0-flash" },
@@ -170,6 +175,9 @@ export interface AiProviderCfg {
   /** Secret API key — kept in the OS keychain, hydrated into memory at boot, never on disk
    *  and never returned to a client. Optional because the on-disk shape omits it. */
   apiKey?: string;
+  /** Runtime-only AI Pass credential marker. The actual token bundle never enters config; this
+   *  bit is hydrated from the native credential store and stripped before every disk write. */
+  connected?: true;
   /** The model selected for this provider (null until the owner picks one). */
   model: string | null;
 }
@@ -533,6 +541,13 @@ export function resolveApiKey(cfg: RepoYetiConfig, provider: AiProviderId): stri
   return cfg.ai?.providers?.[provider]?.apiKey ?? null;
 }
 
+/** Whether a provider has usable authentication. AI Pass is keyed by a runtime-only secure-store
+ * marker; every existing provider retains its API-key path unchanged. */
+export function providerConfigured(cfg: RepoYetiConfig, provider: AiProviderId): boolean {
+  if (provider === "aipass") return cfg.ai?.providers?.aipass?.connected === true;
+  return resolveApiKey(cfg, provider) !== null;
+}
+
 /** Effective model for a provider — the owner's selection, or null when none is picked. */
 export function resolveModel(cfg: RepoYetiConfig, provider: AiProviderId): string | null {
   return cfg.ai?.providers?.[provider]?.model ?? null;
@@ -541,9 +556,9 @@ export function resolveModel(cfg: RepoYetiConfig, provider: AiProviderId): strin
 /** Which provider "Generate" uses: the owner's choice if usable, else the first usable provider. */
 export function effectiveDefaultProvider(cfg: RepoYetiConfig): AiProviderId | null {
   const pref = cfg.ai?.defaultProvider;
-  if (pref && resolveApiKey(cfg, pref) && resolveModel(cfg, pref)) return pref;
+  if (pref && providerConfigured(cfg, pref) && resolveModel(cfg, pref)) return pref;
   for (const id of AI_PROVIDERS) {
-    if (resolveApiKey(cfg, id) && resolveModel(cfg, id)) return id;
+    if (providerConfigured(cfg, id) && resolveModel(cfg, id)) return id;
   }
   return null;
 }
@@ -559,7 +574,7 @@ export function redactAi(cfg: RepoYetiConfig): RedactedAiConfig {
     commitEnabled: cfg.ai?.commitEnabled !== false, // default ON
   };
   for (const id of AI_PROVIDERS) {
-    if (resolveApiKey(cfg, id)) {
+    if (providerConfigured(cfg, id)) {
       out.providers[id] = { configured: true, model: resolveModel(cfg, id) };
     }
   }
@@ -801,11 +816,19 @@ export function loadConfig(): RepoYetiConfig {
  * silently lost; `secrets.ts` has already warned once in that case.
  */
 function stripSecretsForDisk(cfg: RepoYetiConfig): RepoYetiConfig {
-  if (!keychainAvailable()) return cfg; // degraded host → keep plaintext (no regression)
   const clone = JSON.parse(JSON.stringify(cfg)) as RepoYetiConfig;
+  // AI Pass has no degraded plaintext mode under any circumstances.
+  if (clone.ai?.providers?.aipass) {
+    delete clone.ai.providers.aipass.apiKey;
+    delete clone.ai.providers.aipass.connected;
+  }
+  if (!keychainAvailable()) return clone; // degraded host → legacy BYOK behavior only
   if (clone.ai?.providers) {
     for (const p of Object.values(clone.ai.providers)) {
-      if (p) delete p.apiKey;
+      if (p) {
+        delete p.apiKey;
+        delete p.connected;
+      }
     }
   }
   if (clone.oauth) delete clone.oauth.clientSecret;
@@ -845,6 +868,11 @@ export async function hydrateSecrets(cfg: RepoYetiConfig): Promise<void> {
   if (cfg.ai?.providers) {
     for (const [id, p] of Object.entries(cfg.ai.providers)) {
       if (!p) continue;
+      if (id === "aipass") {
+        // Account connection only: never interpret a stray config value as an AI Pass API key.
+        delete p.apiKey;
+        continue;
+      }
       if (p.apiKey) {
         // Legacy plaintext key on disk → move it into the keychain (then it gets stripped).
         if (await setSecret(aiKeyName(id), p.apiKey)) migrated = true;
@@ -854,6 +882,26 @@ export async function hydrateSecrets(cfg: RepoYetiConfig): Promise<void> {
         if (k) p.apiKey = k;
       }
     }
+  }
+
+  // AI Pass never takes the BYOK plaintext fallback above. Its tokens remain one atomic JSON
+  // bundle in the native credential store; config receives only this ephemeral usable marker.
+  const aiPassRaw = await getSecret(AIPASS_TOKEN_BUNDLE);
+  let aiPassStored = false;
+  if (aiPassRaw) {
+    try {
+      const tokens = JSON.parse(aiPassRaw) as { accessToken?: unknown };
+      aiPassStored = typeof tokens.accessToken === "string" && tokens.accessToken.length > 0;
+    } catch {
+      /* malformed secure-store entry stays unusable and is never copied into config */
+    }
+  }
+  const aiPassEntry = cfg.ai?.providers?.aipass;
+  if (aiPassStored) {
+    if (!cfg.ai) cfg.ai = { providers: {} };
+    cfg.ai.providers.aipass = { model: aiPassEntry?.model ?? null, connected: true };
+  } else if (aiPassEntry) {
+    delete aiPassEntry.connected;
   }
 
   if (cfg.oauth) {

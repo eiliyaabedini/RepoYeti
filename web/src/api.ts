@@ -780,23 +780,38 @@ export const api = {
     setProvider: (provider: AiProviderId, patch: { model?: string | null; makeDefault?: boolean }) =>
       req<AiSettings>("PUT", `/api/ai/providers/${provider}`, patch),
     removeProvider: (provider: AiProviderId) =>
-      req<AiSettings>("DELETE", `/api/ai/providers/${provider}`),
+      req<AiSettings & { aipassRevoked?: boolean }>(
+        "DELETE",
+        `/api/ai/providers/${provider}`,
+      ),
     /** Draft a commit message from the repo's diff. With `paths`, scope it to just those
      *  files (smart-commit per-group regenerate); omit for the whole working tree. */
-    commitMessage: (repoId: string, provider?: AiProviderId, paths?: string[]) =>
+    commitMessage: (
+      repoId: string,
+      provider?: AiProviderId,
+      paths?: string[],
+      signal?: AbortSignal,
+    ) =>
       req<{ ok: boolean; message: string; provider: AiProviderId; model: string }>(
         "POST",
         `/api/repos/${repoId}/commit-message`,
         { ...(provider ? { provider } : {}), ...(paths?.length ? { paths } : {}) },
+        signal,
       ),
     /** Propose a multi-commit plan from the repo's working tree (commits nothing). With `paths`,
      *  scope the plan to just those files (the owner's checked selection); omit/empty for the
      *  whole working tree — an empty checked selection is treated as "plan everything". */
-    commitPlan: (repoId: string, provider?: AiProviderId, paths?: string[]) =>
+    commitPlan: (
+      repoId: string,
+      provider?: AiProviderId,
+      paths?: string[],
+      signal?: AbortSignal,
+    ) =>
       req<CommitPlanResponse>(
         "POST",
         `/api/repos/${repoId}/commit-plan`,
         { ...(provider ? { provider } : {}), ...(paths?.length ? { paths } : {}) },
+        signal,
       ),
   },
 };

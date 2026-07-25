@@ -38,7 +38,7 @@ RepoYeti runs a small daemon on your machine, finds every git repo you have, and
 - ☑️ &nbsp;**Bulk actions.** Select any number of repos and pin, star, hide or remove them in one go. Every action undoes.
 - 👀 &nbsp;**Preview a pull.** See the incoming commits, the files they touch, and any conflicts they'd cause, before you pull. Nothing is fetched or merged by looking.
 - 🔍 &nbsp;**Monaco diffs.** The real VS Code editor: syntax highlighting, HEAD-↔-tree diffs, edit and save.
-- 🤖 &nbsp;**Smart Commit (AI).** Split a messy working tree into clean, scoped commits. Bring your own key.
+- 🤖 &nbsp;**Smart Commit (AI).** Split a messy working tree into clean, scoped commits. Connect an AI Pass account or bring your own key.
 - 🪪 &nbsp;**Per-repo identities.** The right git identity for each repo, no `--amend --author` afterthoughts.
 - 🏠 &nbsp;**Self-hosted.** Nothing runs in someone else's cloud. Uninstall it and your repos are untouched.
 
@@ -59,15 +59,22 @@ bun run src/index.ts start --tunnel
 
 Prefer a single binary? Grab one from [Releases](https://github.com/LunarWerxs/RepoYeti/releases).
 
-## AI setup: a free Groq key in 3 clicks
+## AI setup: connect an account or bring your own key
 
-Smart Commit and AI commit messages are bring-your-own-key (there's no bundled key, because Groq revokes any key committed to a public repo). Groq is the suggested provider: free, fast, ~30 seconds:
+Smart Commit and AI commit messages are optional. A first-party build can use **Settings → AI →
+Connect AI Pass**: RepoYeti uses the connected account's shared wallet, so there is no API key to
+create or paste. OAuth tokens stay in the machine's native credential store and AI requests leave
+the browser through the local daemon.
+
+The existing bring-your-own-key providers remain available. Groq is the suggested provider: free,
+fast, and about 30 seconds to set up:
 
 1. Open **[console.groq.com/keys](https://console.groq.com/keys)** and sign in.
 2. Click **Create API Key**, then **Copy**.
 3. In the app, open **Settings → AI**, expand **Groq**, and paste it in.
 
-"Generate" lights up right away. Prefer OpenAI / Claude / Gemini / OpenRouter / DeepSeek? Add that key in the same place instead; your key never leaves the daemon (it's kept in your OS keychain).
+"Generate" lights up right away. Prefer OpenAI / Claude / Gemini / OpenRouter / DeepSeek? Add that
+key in the same place instead; your key never leaves the daemon (it's kept in your OS keychain).
 
 ## The rules
 

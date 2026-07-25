@@ -486,6 +486,7 @@ export interface ActionResult {
 // NOTE: AiProviderId must stay in sync with src/config.ts. Type-only duplication is
 // acceptable here; the backend is the single source of truth for runtime values.
 export type AiProviderId =
+  | "aipass"
   | "anthropic"
   | "openai"
   | "gemini"
@@ -501,7 +502,9 @@ export interface AiCatalogEntry {
   id: AiProviderId;
   label: string;
   url: string;
-  keyPlaceholder: string;
+  keyPlaceholder?: string;
+  /** OAuth account connection (AI Pass), never an API-key input. */
+  accountConnection?: boolean;
   free?: boolean;
   /** The one provider we steer new owners to (Groq) — renders a "Suggested" badge + get-a-key nudge. */
   suggested?: boolean;

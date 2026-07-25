@@ -230,10 +230,14 @@ export const OWNER_ONLY: readonly string[] = [
   "GET /api/ai/catalog",
   "GET /api/ai/settings",
   "PUT /api/ai/settings",
+  "GET /api/ai/aipass/connect",
   "POST /api/ai/providers/:provider/connect",
   "GET /api/ai/providers/:provider/models",
   "PUT /api/ai/providers/:provider",
   "DELETE /api/ai/providers/:provider",
+  // Public only as the state-gated return leg of the owner-started OAuth flow. It sits outside
+  // /api/* like the existing sign-in callback and is not a share-link guest capability.
+  "GET /aipass/oauth/callback",
   // agent surface + its safety rail
   "POST /api/mcp",
   "GET /api/approvals",

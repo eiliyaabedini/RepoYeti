@@ -30,6 +30,16 @@ export class AiError extends Error {
 /** Injectable fetch (defaults to the global). */
 export type FetchFn = (input: string, init?: RequestInit) => Promise<Response>;
 
+/** Optional server-owned completion transport. AI Pass supplies this to consume its SSE stream
+ *  with refresh and cancellation while reusing the existing prompt/request builders. */
+export interface AiGenerationOptions {
+  signal?: AbortSignal;
+  streamCompletion?: (
+    body: Record<string, unknown>,
+    options: { signal?: AbortSignal; timeoutMs: number },
+  ) => Promise<string>;
+}
+
 const REQUEST_TIMEOUT_MS = 20_000;
 
 // ── rate-limit gate (anti-hammer) ────────────────────────────────────────────────
@@ -385,7 +395,9 @@ export async function requestJson(
   }
   let res: Response;
   try {
-    res = await fetchImpl(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+    const timeout = AbortSignal.timeout(timeoutMs);
+    const signal = init.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
+    res = await fetchImpl(url, { ...init, signal });
   } catch {
     throw new AiError("AI_UNREACHABLE", "could not reach the AI provider (timeout or network error)");
   }
@@ -449,6 +461,7 @@ export async function generateCommitMessage(
   style: CommitStyle,
   fetchImpl: FetchFn = fetch,
   fileCount = 0,
+  options: AiGenerationOptions = {},
 ): Promise<string> {
   const adapter = AI_ADAPTERS[provider];
   // `concise` never writes a body, so the anchor would only be an instruction it must ignore
@@ -459,18 +472,31 @@ export async function generateCommitMessage(
     ...fewShotTurns(style),
     { role: "user" as const, content: user },
   ];
-  const json = await requestJson(
-    adapter.generateUrl(model, apiKey),
-    {
-      method: "POST",
-      headers: adapter.headers(apiKey),
-      body: JSON.stringify(adapter.buildBody(model, messages, messageMaxTokens(style), MESSAGE_SAMPLING)),
-    },
-    fetchImpl,
-    REQUEST_TIMEOUT_MS,
-    provider, // share the rate-limit pause with the plan call — same provider, same budget
-  );
-  const text = adapter.extractCompletion(json);
+  const requestBody = adapter.buildBody(
+    model,
+    messages,
+    messageMaxTokens(style),
+    MESSAGE_SAMPLING,
+  ) as Record<string, unknown>;
+  const text = options.streamCompletion
+    ? await options.streamCompletion(requestBody, {
+        signal: options.signal,
+        timeoutMs: REQUEST_TIMEOUT_MS,
+      })
+    : adapter.extractCompletion(
+        await requestJson(
+          adapter.generateUrl(model, apiKey),
+          {
+            method: "POST",
+            headers: adapter.headers(apiKey),
+            body: JSON.stringify(requestBody),
+            signal: options.signal,
+          },
+          fetchImpl,
+          REQUEST_TIMEOUT_MS,
+          provider, // share the rate-limit pause with the plan call — same provider, same budget
+        ),
+      );
   const cleaned = cleanCommitMessage(text ?? "");
   if (!cleaned) throw new AiError("AI_ERROR", "the model returned an empty message");
   return cleaned;

@@ -73,11 +73,18 @@ const adding = ref<AiProviderId[]>([]);
 /** The "Add provider" trigger — focus lands back here when an added card is dismissed. */
 const addProviderBtn = useTemplateRef<{ $el?: HTMLElement }>("addProviderBtn");
 const shownProviders = computed<AiCatalogEntry[]>(() =>
-  PROVIDERS.value.filter((p) => isConfigured(p.id) || adding.value.includes(p.id)),
+  PROVIDERS.value.filter(
+    (p) => p.accountConnection || isConfigured(p.id) || adding.value.includes(p.id),
+  ),
 );
 /** Catalogue entries not connected and not already staged for adding — the picker's contents. */
 const addableProviders = computed<AiCatalogEntry[]>(() =>
-  PROVIDERS.value.filter((p) => !isConfigured(p.id) && !adding.value.includes(p.id)),
+  PROVIDERS.value.filter(
+    (p) =>
+      !p.accountConnection &&
+      !isConfigured(p.id) &&
+      !adding.value.includes(p.id),
+  ),
 );
 function beginAdd(id: AiProviderId): void {
   if (!adding.value.includes(id)) adding.value.push(id);
@@ -180,9 +187,14 @@ async function makeDefault(id: AiProviderId): Promise<void> {
 
 async function remove(id: AiProviderId): Promise<void> {
   try {
-    await store.removeProvider(id);
+    const revoked = await store.removeProvider(id);
     rows[id] = blank();
-    toast.success(t("settings.toastRemoved", { name: nameOf(id) }));
+    if (id === "aipass") {
+      if (revoked === false) toast.warning(t("settings.aipassRevokeFailed"));
+      else toast.success(t("settings.aipassDisconnected"));
+    } else {
+      toast.success(t("settings.toastRemoved", { name: nameOf(id) }));
+    }
   } catch {
     toast.error(t("settings.toastRemoveFailed"));
   }
@@ -274,6 +286,13 @@ async function onDiffDetail(detail: string): Promise<void> {
                 {{ $t("settings.badgeSuggested") }}
               </Badge>
               <Badge
+                v-else-if="p.accountConnection"
+                variant="info"
+                class="px-1.5 py-0 text-[10px]"
+              >
+                {{ $t("settings.badgeAccount") }}
+              </Badge>
+              <Badge
                 v-if="settings.defaultProvider === p.id"
                 variant="primary"
                 class="px-1.5 py-0 text-[10px]"
@@ -308,9 +327,24 @@ async function onDiffDetail(detail: string): Promise<void> {
                 >{{ p.url }}</a>
               </div>
 
+              <!-- AI Pass is an OAuth account connection. No credential value ever enters this
+                   component; navigation starts the daemon-owned Authorization Code + PKCE flow. -->
+              <div
+                v-if="!isConfigured(p.id) && p.accountConnection"
+                class="flex flex-col items-start gap-2.5"
+              >
+                <p class="text-[12px] text-muted-foreground">
+                  {{ $t("settings.aipassNudge") }}
+                </p>
+                <Button as="a" href="/api/ai/aipass/connect" size="sm">
+                  <Link2 />
+                  {{ $t("settings.connectAiPass") }}
+                </Button>
+              </div>
+
               <!-- not configured → bring your own key. For the suggested provider (Groq), a short
                    nudge: it's free + fast and takes ~30s, so a fresh install has an obvious path. -->
-              <div v-if="!isConfigured(p.id)" class="flex flex-col gap-2.5">
+              <div v-else-if="!isConfigured(p.id)" class="flex flex-col gap-2.5">
                 <p v-if="p.suggested" class="text-[12px] text-muted-foreground">
                   {{ $t("settings.suggestedNudge") }}
                   <a
@@ -326,7 +360,7 @@ async function onDiffDetail(detail: string): Promise<void> {
                     type="password"
                     class="flex-1"
                     :aria-label="`${p.label} API key`"
-                    :placeholder="p.keyPlaceholder"
+                    :placeholder="p.keyPlaceholder ?? ''"
                     @keyup.enter="connect(p.id)"
                   />
                   <Button
@@ -392,7 +426,11 @@ async function onDiffDetail(detail: string): Promise<void> {
                     <template v-if="rowFor(p.id).confirmRemove">
                       <Button variant="destructive" size="sm" @click="remove(p.id)">
                         <Check />
-                        {{ $t("settings.btnConfirmRemove") }}
+                        {{
+                          p.accountConnection
+                            ? $t("settings.btnConfirmDisconnect")
+                            : $t("settings.btnConfirmRemove")
+                        }}
                       </Button>
                       <Button
                         variant="ghost"
@@ -408,7 +446,11 @@ async function onDiffDetail(detail: string): Promise<void> {
                       variant="ghost"
                       size="icon-sm"
                       class="text-muted-foreground hover:text-destructive"
-                      :aria-label="$t('settings.btnRemoveKey')"
+                      :aria-label="
+                        p.accountConnection
+                          ? $t('settings.btnDisconnectAiPass')
+                          : $t('settings.btnRemoveKey')
+                      "
                       @click="rowFor(p.id).confirmRemove = true"
                     >
                       <Trash2 />

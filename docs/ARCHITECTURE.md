@@ -1364,3 +1364,48 @@ Guest AI generation follows the same owner-daemon rule as owner generation. The 
 only `/api/ai/availability` (`usable` and `commitEnabled`); provider, model, and key configuration
 remain owner-only. `commit-message` and `commit-plan` execute on the sharer's daemon with its
 keychain-backed key and return only their generated result.
+
+## 19. Optional AI Pass account connection
+
+AI Pass is an OAuth account connection alongside the existing BYOK providers, not another key
+field. First-party builds obtain the public client id from protected build/runtime configuration;
+the value is never committed, logged, returned by a JSON API, or placed in the PWA bundle. As
+required for a public OAuth client, it appears only in the authorization and token protocol
+requests. A build with no configured client fails closed at the start of the connection and all
+existing providers keep their prior behavior.
+
+The daemon is the OAuth client and authenticated transport boundary:
+
+1. `GET /api/ai/aipass/connect` is owner-gated and starts Authorization Code + PKCE S256. State and
+   verifier are independent 256-bit random values held in an expiring, one-use in-memory
+   transaction. The authorization, token, userinfo, and revocation endpoints are read from and
+   validated against `https://aipass.one/.well-known/oauth-authorization-server`; no client secret
+   exists.
+2. `/aipass/oauth/callback` consumes state once, exchanges the code, validates userinfo, performs
+   live model discovery, and atomically writes one access/refresh token bundle to `Bun.secrets`.
+   There is deliberately no config-file fallback when the native credential store is unavailable.
+   `config.json` retains only the selected model; the in-memory `connected` marker is rehydrated
+   from the credential store at boot and stripped from disk writes.
+3. Models always come from `GET https://aipass.one/oauth2/v1/models?detailed=true`. The parser
+   accepts the OpenAI list envelope and the legacy string-array form. Detailed results are filtered
+   by the advertised `chat_completions` method; no model id is built into RepoYeti.
+4. Commit messages and plans use
+   `POST https://aipass.one/oauth2/v1/chat/completions` with `stream:true`. The daemon consumes the
+   bounded SSE stream and returns only the finished RepoYeti result. Browser abort, modal close, or
+   Stop aborts that upstream request so wallet-billed work does not continue invisibly.
+5. Refresh is mutexed. A rotated access/refresh pair replaces the single credential-store bundle
+   before the retried wallet request starts. Disconnect attempts refresh- and access-token
+   revocation, then clears local tokens even if the network is unavailable.
+
+All discovery/token/userinfo/model/error responses, request bodies, and streams have byte ceilings
+and deadlines. Tokens never enter Vue state, local/session storage, query strings, cookies, config,
+logs, telemetry, errors, or committed files.
+
+### Callback prerequisite
+
+The first-party AI Pass client registration must allow RepoYeti's exact callback path
+(`/aipass/oauth/callback`) for the stable HTTPS application origin and must support native loopback
+redirects on the daemon's runtime port for local use. A rotating `trycloudflare.com` hostname cannot
+be safely wildcarded as an OAuth redirect; remote account connection therefore requires the stable
+registered origin. If those redirect registrations are absent, AI Pass rejects the exchange and
+RepoYeti retains no tokens—the integration does not substitute a shim or fake a successful login.

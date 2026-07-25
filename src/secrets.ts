@@ -60,8 +60,9 @@ function warnOnce(op: string, e: unknown): void {
   warned = true;
   console.warn(
     `repoyeti: OS keychain unavailable (${op}: ${e instanceof Error ? e.message : String(e)}). ` +
-      `Storing secrets in plaintext ~/.repoyeti/config.json instead — install your platform's ` +
-      `secret service (libsecret on Linux) for at-rest protection.`,
+      `Legacy settings may use the protected config-file fallback; strict account integrations ` +
+      `remain disconnected. Install your platform's secret service (libsecret on Linux) for ` +
+      `native at-rest protection.`,
   );
 }
 
@@ -145,3 +146,8 @@ export const RELAY_PRIVATE_KEY = "relay/privateKey";
  *  (studio.connections.icu/v1/app-data) server-to-server, without the browser ever holding a token.
  *  Sensitive → keychain-only, NEVER written to config.json. See src/connections-sync.ts. */
 export const CONNECTIONS_REFRESH_TOKEN = "connections/refreshToken";
+/** AI Pass OAuth access + refresh tokens, serialized as ONE bundle so refresh-token rotation is
+ *  one credential-store replacement rather than two independently-failing writes. Unlike legacy
+ *  BYOK keys, this bundle has no plaintext-config fallback: src/aipass.ts fails closed when the
+ *  native credential store cannot accept it. */
+export const AIPASS_TOKEN_BUNDLE = "aipass/tokens";

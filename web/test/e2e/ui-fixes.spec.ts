@@ -373,7 +373,7 @@ test("a pinned repo drops the pin badge inside the Pinned section", async ({ pag
   await expect(page.locator("section").first().locator(`[id="${repoId}"]`)).toHaveCount(0);
 });
 
-test("AI providers list only what's connected, behind an Add provider picker", async ({ page }) => {
+test("AI Pass is an account connection while key providers stay behind Add provider", async ({ page }) => {
   await page.setViewportSize({ width: 1400, height: 1000 });
   await page.goto("/");
 
@@ -381,8 +381,12 @@ test("AI providers list only what's connected, behind an Add provider picker", a
   await page.getByRole("menuitem", { name: "Settings" }).click();
   await page.getByRole("tab", { name: "Automation" }).click();
 
-  // With nothing connected the catalogue is NOT dumped on screen.
-  await expect(page.getByText("No providers connected yet.")).toBeVisible();
+  // AI Pass is always offered as an account connection, with no API-key field.
+  await page.getByRole("button", { name: /AI Pass/ }).click();
+  await expect(page.getByRole("link", { name: "Connect AI Pass" })).toBeVisible();
+  await expect(page.getByLabel("AI Pass API key")).toHaveCount(0);
+
+  // BYOK providers are still not dumped on screen.
   const addBtn = page.getByRole("button", { name: "Add provider" });
   await expect(addBtn).toBeVisible();
 
@@ -394,9 +398,10 @@ test("AI providers list only what's connected, behind an Add provider picker", a
   await firstOption.click();
   await expect(page.getByLabel(`${providerName} API key`)).toBeVisible();
 
-  // Dismissing it puts the list back to empty.
+  // Dismissing it removes that BYOK card while the optional account connection remains.
   await page.getByRole("button", { name: "Cancel" }).first().click();
-  await expect(page.getByText("No providers connected yet.")).toBeVisible();
+  await expect(page.getByRole("link", { name: "Connect AI Pass" })).toBeVisible();
+  await expect(page.getByLabel(`${providerName} API key`)).toHaveCount(0);
 });
 
 test("remove dialog does not scroll sideways on a long path", async ({ page }) => {

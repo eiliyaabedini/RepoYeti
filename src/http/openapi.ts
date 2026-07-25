@@ -228,15 +228,16 @@ export const META: Record<string, RouteMeta> = {
   "POST /api/accounts/switch": { summary: "Switch the active GitHub (gh) account (and align the credential username pin).", body: AccountSwitchSchema, tags: ["accounts"] },
   "PUT /api/accounts/identity": { summary: "Link (or unlink) a GitHub account to a saved commit identity, applied on switch.", body: AccountIdentitySchema, tags: ["accounts"] },
 
-  // ── AI (bring-your-own-key) ───────────────────────────────────────────────────────
+  // ── AI (optional account connection + existing bring-your-own-key paths) ─────────
   "GET /api/ai/catalog": { summary: "Static provider catalog (display metadata; no secrets).", tags: ["ai"] },
   "GET /api/ai/availability": { summary: "Guest-safe AI availability (no provider, model, or key details).", tags: ["ai"] },
-  "GET /api/ai/settings": { summary: "Redacted AI settings (never includes a key).", tags: ["ai"] },
+  "GET /api/ai/settings": { summary: "Redacted AI settings (never includes keys or OAuth tokens).", tags: ["ai"] },
   "PUT /api/ai/settings": { summary: "Update commit style / default provider.", body: AiSettingsSchema, tags: ["ai"] },
-  "POST /api/ai/providers/:provider/connect": { summary: "Connect a provider (validates the key, then saves it).", body: ConnectSchema, tags: ["ai"] },
+  "GET /api/ai/aipass/connect": { summary: "Begin the optional AI Pass account connection (Authorization Code + PKCE).", tags: ["ai"] },
+  "POST /api/ai/providers/:provider/connect": { summary: "Connect a BYOK provider (validates the key, then saves it).", body: ConnectSchema, tags: ["ai"] },
   "GET /api/ai/providers/:provider/models": { summary: "Re-list models for a connected provider.", tags: ["ai"] },
   "PUT /api/ai/providers/:provider": { summary: "Set the selected model and/or mark this provider default.", body: ProviderUpdateSchema, tags: ["ai"] },
-  "DELETE /api/ai/providers/:provider": { summary: "Remove a provider's stored key.", tags: ["ai"] },
+  "DELETE /api/ai/providers/:provider": { summary: "Disconnect an account or remove a provider's stored key.", tags: ["ai"] },
   "POST /api/repos/:id/commit-message": { summary: "Draft a commit message from the repo's diff.", body: CommitMessageSchema, tags: ["ai"] },
   "POST /api/repos/:id/commit-plan": { summary: "Propose a multi-commit plan (read-only; commits nothing).", body: CommitPlanSchema, tags: ["ai"] },
 

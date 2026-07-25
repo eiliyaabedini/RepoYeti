@@ -4,9 +4,19 @@
 // per-file selection (created once by RepoCard — see @/lib/changes-selection) so "Commit
 // selected" stays in sync with the checkboxes in ChangesTree. `loadRecentMsgs` is exposed so
 // RepoCard can refresh the "recent" chips right after expanding a dirty repo (see toggle()).
-import { computed, ref } from "vue";
+import { computed, onBeforeUnmount, ref } from "vue";
 import { useI18n } from "vue-i18n";
-import { ArrowUpFromLine, ChevronDown, GitCommitHorizontal, History, Loader2, Pencil, RefreshCw, Sparkles } from "@lucide/vue";
+import {
+  ArrowUpFromLine,
+  ChevronDown,
+  GitCommitHorizontal,
+  History,
+  Loader2,
+  Pencil,
+  RefreshCw,
+  Sparkles,
+  Square,
+} from "@lucide/vue";
 import { toast } from "vue-sonner";
 import { useStore } from "../../store";
 import { api, ApiError } from "../../api";
@@ -75,11 +85,14 @@ type CommitMode = "commit" | "amend" | "push" | "sync";
 // is collapsed/re-expanded — RepoCard's own scope doesn't unmount, so it survives there.
 const commitMsg = defineModel<string>("commitMsg", { required: true });
 const generating = ref(false);
+let generationController: AbortController | null = null;
 const committing = ref(false);
 // Smart-commit (AI multi-commit splitter) — opt-in plan editor in a modal, or YOLO mode
 // (Settings) which generates the plan and commits it immediately with no review.
 const smartOpen = ref(false);
 const smartBusy = ref(false);
+const smartGenerating = ref(false);
+let smartGenerationController: AbortController | null = null;
 function onSmartCommitted(): void {
   void loadRecentMsgs(); // the last few subjects changed
 }
@@ -88,6 +101,10 @@ function onSmartCommitted(): void {
 const smartSync = ref(false);
 /** The Smart Commit button: open the review editor, or run YOLO if the owner enabled it. */
 function runSmart(sync = false): void {
+  if (smartGenerating.value) {
+    smartGenerationController?.abort();
+    return;
+  }
   if (!ensureAiUsable()) return;
   smartSync.value = sync;
   if (store.aiSettings.yolo) void runYolo(sync);
@@ -102,11 +119,21 @@ function planLine(g: { type: string; scope?: string; subject: string; body?: str
  *  so nothing is left behind. Only pushes when the owner explicitly picked "Auto commit & sync". */
 async function runYolo(sync: boolean): Promise<void> {
   if (smartBusy.value) return;
+  const controller = new AbortController();
+  smartGenerationController = controller;
   smartBusy.value = true;
+  smartGenerating.value = true;
   try {
     // Scope to the checked selection, like GitHub Desktop's "stage + commit"; an empty
     // selection (nothing checked) means "plan the whole working tree" — never an empty plan.
-    const res = await store.genCommitPlan(props.repo.id, undefined, [...props.treeSelection.selected]);
+    const res = await store.genCommitPlan(
+      props.repo.id,
+      undefined,
+      [...props.treeSelection.selected],
+      controller.signal,
+    );
+    smartGenerating.value = false;
+    if (smartGenerationController === controller) smartGenerationController = null;
     const commits = res.plan.groups.map((g) => ({ message: planLine(g), paths: [...g.files] }));
     if (res.plan.leftovers.length) commits.push({ message: "chore: miscellaneous changes", paths: [...res.plan.leftovers] });
     if (!commits.length) {
@@ -121,8 +148,11 @@ async function runYolo(sync: boolean): Promise<void> {
     void loadRecentMsgs();
     toast.success(r.synced ? t("repo.smartCommit.doneSynced") : t("repo.smartCommit.done"));
   } catch (e) {
+    if (controller.signal.aborted) return;
     toast.error(e instanceof ApiError ? friendly(e.code ?? "ERROR") || e.message : t("repo.smartCommit.failed"));
   } finally {
+    if (smartGenerationController === controller) smartGenerationController = null;
+    smartGenerating.value = false;
     smartBusy.value = false;
   }
 }
@@ -140,17 +170,37 @@ async function loadRecentMsgs(): Promise<void> {
 }
 
 async function generate(): Promise<void> {
+  if (generating.value) {
+    generationController?.abort();
+    return;
+  }
   if (!ensureAiUsable()) return;
+  const controller = new AbortController();
+  generationController = controller;
   generating.value = true;
   try {
-    commitMsg.value = await store.genCommitMessage(props.repo.id);
+    commitMsg.value = await store.genCommitMessage(
+      props.repo.id,
+      undefined,
+      undefined,
+      controller.signal,
+    );
   } catch (e) {
+    if (controller.signal.aborted) return;
     const msg = e instanceof ApiError ? (friendly(e.code ?? "ERROR") || e.message) : t("repo.commit.generateFailed");
     toast.error(msg);
   } finally {
-    generating.value = false;
+    if (generationController === controller) {
+      generationController = null;
+      generating.value = false;
+    }
   }
 }
+
+onBeforeUnmount(() => {
+  generationController?.abort();
+  smartGenerationController?.abort();
+});
 
 async function doCommit(mode: CommitMode = "commit"): Promise<void> {
   const msg = commitMsg.value.trim();
@@ -278,16 +328,25 @@ defineExpose({ loadRecentMsgs, recentMsgs });
           <TooltipTrigger as-child>
             <button
               type="button"
-              :disabled="generating"
-              :aria-label="$t('repo.commit.generateTitle')"
+              :aria-label="
+                generating
+                  ? $t('repo.commit.stopGenerating')
+                  : $t('repo.commit.generateTitle')
+              "
               class="flex size-7 items-center justify-center rounded-md text-primary outline-none transition-colors hover:bg-accent disabled:opacity-50 focus-visible:ring-2 focus-visible:ring-ring/40"
               @click="generate"
             >
-              <Loader2 v-if="generating" :size="16" class="animate-spin" />
+              <Square v-if="generating" :size="14" />
               <Sparkles v-else :size="16" />
             </button>
           </TooltipTrigger>
-          <TooltipContent>{{ $t("repo.commit.generateTitle") }}</TooltipContent>
+          <TooltipContent>
+            {{
+              generating
+                ? $t("repo.commit.stopGenerating")
+                : $t("repo.commit.generateTitle")
+            }}
+          </TooltipContent>
         </Tooltip>
       </div>
     </div>
@@ -357,13 +416,24 @@ defineExpose({ loadRecentMsgs, recentMsgs });
               <Button
                 variant="outline"
                 class="gemini-auto h-9 rounded-r-none"
-                :disabled="smartBusy || committing"
-                :aria-label="$t('repo.smartCommit.button')"
+                :disabled="(smartBusy && !smartGenerating) || committing"
+                :aria-label="
+                  smartGenerating
+                    ? $t('repo.smartCommit.stopGenerating')
+                    : $t('repo.smartCommit.button')
+                "
                 @click="runSmart()"
               >
-                <Loader2 v-if="smartBusy" class="animate-spin" />
+                <Square v-if="smartGenerating" />
+                <Loader2 v-else-if="smartBusy" class="animate-spin" />
                 <Sparkles v-else />
-                <span>{{ $t("repo.smartCommit.button") }}</span>
+                <span>
+                  {{
+                    smartGenerating
+                      ? $t("repo.smartCommit.stopGenerating")
+                      : $t("repo.smartCommit.button")
+                  }}
+                </span>
               </Button>
             </span>
           </TooltipTrigger>

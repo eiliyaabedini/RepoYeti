@@ -6,7 +6,15 @@
 // is a SUGGESTION: the daemon validates it, the owner edits it, and a separate call commits.
 import type { AiProviderId, CommitStyle } from "../config.ts";
 import { AI_ADAPTERS, PLAN_SAMPLING, planMaxTokens } from "./adapters.ts";
-import { AiError, BODY_DOCTRINE, requestJson, wrapCommitBody, type AiCode, type FetchFn } from "./commit-message.ts";
+import {
+  AiError,
+  BODY_DOCTRINE,
+  requestJson,
+  wrapCommitBody,
+  type AiCode,
+  type AiGenerationOptions,
+  type FetchFn,
+} from "./commit-message.ts";
 import { normalizeRelPath } from "../paths.ts";
 
 const PLAN_TIMEOUT_MS = 45_000;
@@ -346,6 +354,7 @@ export async function generateCommitPlan(
   input: CommitPlanInput,
   style: CommitStyle,
   fetchImpl: FetchFn = fetch,
+  options: AiGenerationOptions = {},
 ): Promise<CommitPlan> {
   const adapter = AI_ADAPTERS[provider];
   const system = planSystemPrompt(style);
@@ -370,14 +379,27 @@ export async function generateCommitPlan(
     );
 
   const ask = async (user: string): Promise<CommitPlan | null> => {
-    const json = await requestJson(
-      adapter.generateUrl(model, apiKey),
-      { method: "POST", headers: adapter.headers(apiKey), body: JSON.stringify(build(model, system, user)) },
-      fetchImpl,
-      PLAN_TIMEOUT_MS,
-      provider, // gate on 429 so re-clicking Auto can't machine-gun a limited provider
-    );
-    return parseCommitPlan(adapter.extractCompletion(json), knownPaths);
+    const requestBody = build(model, system, user) as Record<string, unknown>;
+    const text = options.streamCompletion
+      ? await options.streamCompletion(requestBody, {
+          signal: options.signal,
+          timeoutMs: PLAN_TIMEOUT_MS,
+        })
+      : adapter.extractCompletion(
+          await requestJson(
+            adapter.generateUrl(model, apiKey),
+            {
+              method: "POST",
+              headers: adapter.headers(apiKey),
+              body: JSON.stringify(requestBody),
+              signal: options.signal,
+            },
+            fetchImpl,
+            PLAN_TIMEOUT_MS,
+            provider, // gate on 429 so re-clicking Auto can't machine-gun a limited provider
+          ),
+        );
+    return parseCommitPlan(text, knownPaths);
   };
 
   // One retry: models occasionally wrap the JSON in prose or truncate it. A terse second ask

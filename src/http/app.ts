@@ -7,6 +7,7 @@
  */
 import { Hono } from "hono";
 import type { RepoYetiConfig } from "../config.ts";
+import { aiPassClient, type AiPassClient } from "../aipass.ts";
 import { authMiddleware, isRemoteRequest } from "../auth.ts";
 import { loopbackGuard } from "../loopback-guard.mjs";
 import { mountWeb } from "./web.ts";
@@ -79,6 +80,8 @@ import * as collaborations from "./routes/collaborations.ts";
 
 export interface AppHooks {
   requestShutdown?: () => void;
+  /** Test/host seam; production uses the native-store-backed singleton. */
+  aiPass?: AiPassClient;
 }
 
 export function createApp(cfg: RepoYetiConfig, hooks: AppHooks = {}): Hono {
@@ -146,7 +149,11 @@ export function createApp(cfg: RepoYetiConfig, hooks: AppHooks = {}): Hono {
   // MUST be registered first so it fronts every /api/* route below.
   app.use("/api/*", authMiddleware(cfg));
 
-  const deps: Deps = { cfg, requestShutdown: hooks.requestShutdown };
+  const deps: Deps = {
+    cfg,
+    aiPass: hooks.aiPass ?? aiPassClient,
+    requestShutdown: hooks.requestShutdown,
+  };
 
   // Register every route module, preserving the original route registration order.
   health.register(app, deps);

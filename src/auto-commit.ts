@@ -29,12 +29,14 @@ import { currentGitOperation } from "./git.ts";
 import { smartCommitRepo, pullRepo, pushRepo, planCommitInput } from "./service/index.ts";
 import {
   effectiveDefaultProvider,
+  providerConfigured,
   resolveApiKey,
   resolveModel,
   DEFAULT_DIFF_DETAIL,
   type RepoYetiConfig,
 } from "./config.ts";
 import { generateCommitPlan, heuristicPlan, type CommitPlan, type CommitPlanGroup } from "./ai.ts";
+import { aiPassClient } from "./aipass.ts";
 
 /** Interval-mode cadence bounds (seconds): 1 min floor (auto-commit is heavier than a fetch),
  *  24 h ceiling. Default 15 min. */
@@ -217,13 +219,26 @@ async function buildPlan(repoId: string): Promise<BuiltPlan> {
   let plan: CommitPlan;
   let degraded = false;
   if (cfg && provider) {
-    const apiKey = resolveApiKey(cfg, provider);
+    const apiKey = provider === "aipass" ? "" : resolveApiKey(cfg, provider);
     const model = resolveModel(cfg, provider);
     const style = cfg.ai?.style ?? "conventional";
     try {
       plan =
-        apiKey && model
-          ? await generateCommitPlan(provider, apiKey, model, input, style)
+        providerConfigured(cfg, provider) && apiKey !== null && model
+          ? await generateCommitPlan(
+              provider,
+              apiKey,
+              model,
+              input,
+              style,
+              undefined,
+              provider === "aipass"
+                ? {
+                    streamCompletion: (body, options) =>
+                      aiPassClient.streamCompletion(body, options),
+                  }
+                : {},
+            )
           : heuristicPlan(input);
     } catch {
       // Provider down / quota / unparseable. The owner asked for AI-split commits — "skip"

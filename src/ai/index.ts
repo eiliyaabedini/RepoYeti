@@ -25,7 +25,7 @@
 export type { AiModel } from "./adapters.ts";
 export { parseModels, extractCompletion } from "./adapters.ts";
 
-export type { AiCode, FetchFn } from "./commit-message.ts";
+export type { AiCode, AiGenerationOptions, FetchFn } from "./commit-message.ts";
 export {
   AiError,
   systemPromptFor,

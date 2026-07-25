@@ -144,21 +144,33 @@ export function useAi(
       throw e;
     }
   }
-  async function removeProvider(provider: AiProviderId): Promise<void> {
-    aiSettings.value = await api.ai.removeProvider(provider);
+  async function removeProvider(provider: AiProviderId): Promise<boolean | undefined> {
+    const result = await api.ai.removeProvider(provider);
+    aiSettings.value = result;
+    return result.aipassRevoked;
   }
   /** Draft a commit message from the repo's diff (or just `paths`, for smart-commit per-group
    *  regenerate). Throws ApiError → caller toasts. */
-  async function genCommitMessage(repoId: string, provider?: AiProviderId, paths?: string[]): Promise<string> {
-    return (await api.ai.commitMessage(repoId, provider, paths)).message;
+  async function genCommitMessage(
+    repoId: string,
+    provider?: AiProviderId,
+    paths?: string[],
+    signal?: AbortSignal,
+  ): Promise<string> {
+    return (await api.ai.commitMessage(repoId, provider, paths, signal)).message;
   }
 
   /** Propose a multi-commit plan from the repo's working tree (commits nothing). With `paths`,
    *  scope the plan to just the owner's checked selection; an empty/omitted selection plans the
    *  whole working tree (see api.ai.commitPlan). Throws ApiError (e.g. NO_AI_PROVIDER /
    *  NOTHING_TO_COMMIT) → the caller toasts. */
-  async function genCommitPlan(repoId: string, provider?: AiProviderId, paths?: string[]): Promise<CommitPlanResponse> {
-    return api.ai.commitPlan(repoId, provider, paths);
+  async function genCommitPlan(
+    repoId: string,
+    provider?: AiProviderId,
+    paths?: string[],
+    signal?: AbortSignal,
+  ): Promise<CommitPlanResponse> {
+    return api.ai.commitPlan(repoId, provider, paths, signal);
   }
 
   /** Execute an (owner-edited) commit plan. Sets the commit busy state, reloads the changed-

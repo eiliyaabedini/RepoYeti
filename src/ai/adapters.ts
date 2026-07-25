@@ -266,6 +266,13 @@ const geminiContents = (messages: ChatMessage[]): Array<Record<string, unknown>>
     .map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
 
 export const AI_ADAPTERS: Record<AiProviderId, AiAdapter> = {
+  // Authentication, refresh, and SSE consumption live in src/aipass.ts. This entry contributes
+  // only the OpenAI-compatible request shape used by the existing commit prompt builders.
+  aipass: openAiCompatible({
+    modelsUrl: "https://aipass.one/oauth2/v1/models?detailed=true",
+    generateUrl: "https://aipass.one/oauth2/v1/chat/completions",
+    keep: isChatModel,
+  }),
   anthropic: {
     modelsUrl: () => "https://api.anthropic.com/v1/models?limit=1000",
     generateUrl: () => "https://api.anthropic.com/v1/messages",

@@ -17,6 +17,7 @@ import {
   GitCommitHorizontal,
   Pencil,
   RefreshCw,
+  Square,
 } from "@lucide/vue";
 import { toast } from "vue-sonner";
 import { useStore } from "../store";
@@ -87,6 +88,8 @@ const leftovers = ref<string[]>([]);
 const planBaseline = ref("");
 /** Per-group "regenerating message" flags, keyed by group key. */
 const regenBusy = reactive<Record<string, boolean>>({});
+let generationController: AbortController | null = null;
+const regenControllers = new Map<string, AbortController>();
 /** Path whose inline diff is expanded, or null. Single-open across the whole editor, so at
  *  most one Monaco diff is ever mounted (same cost as the full-screen file viewer). */
 const openDiff = ref<string | null>(null);
@@ -125,6 +128,8 @@ dragAndDrop({
   plugins: [animations()],
 });
 onBeforeUnmount(() => {
+  generationController?.abort();
+  for (const controller of regenControllers.values()) controller.abort();
   if (groupsParent.value) tearDown(groupsParent.value);
 });
 
@@ -221,6 +226,9 @@ const degradedTitle = computed(() => {
 let genSeq = 0;
 
 async function generate(): Promise<void> {
+  generationController?.abort();
+  const controller = new AbortController();
+  generationController = controller;
   const token = ++genSeq;
   loading.value = true;
   error.value = null;
@@ -229,18 +237,31 @@ async function generate(): Promise<void> {
   try {
     // Empty selectedPaths (nothing checked) is passed through as-is — genCommitPlan/the API
     // layer already treat an empty array the same as "no scope", i.e. plan everything.
-    const res = await store.genCommitPlan(props.repoId, undefined, props.selectedPaths);
+    const res = await store.genCommitPlan(
+      props.repoId,
+      undefined,
+      props.selectedPaths,
+      controller.signal,
+    );
     if (token !== genSeq) return; // superseded mid-flight — a newer plan owns the editor now
     applyPlan(res.plan);
     if (res.fallback) degraded.value = true;
   } catch (e) {
     if (token !== genSeq) return; // a stale failure must not blank a newer plan
+    if (controller.signal.aborted) return;
     error.value = e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e);
     groups.value = [];
     leftovers.value = [];
   } finally {
-    if (token === genSeq) loading.value = false;
+    if (token === genSeq) {
+      if (generationController === controller) generationController = null;
+      loading.value = false;
+    }
   }
+}
+
+function stopGenerating(): void {
+  generationController?.abort();
 }
 
 // `immediate` matters: the caller mounts this dialog with `v-if="smartOpen"` at the very moment
@@ -252,6 +273,10 @@ watch(
   () => props.open,
   (open) => {
     if (open) void generate();
+    else {
+      generationController?.abort();
+      for (const controller of regenControllers.values()) controller.abort();
+    }
   },
   { immediate: true },
 );
@@ -391,13 +416,22 @@ function applyMessageToGroup(g: EditableGroup, msg: string): void {
 /** Regenerate ONE commit's message from just its files, via the default AI provider. */
 async function regenerate(g: EditableGroup): Promise<void> {
   if (regenBusy[g.key] || g.files.length === 0) return;
+  const controller = new AbortController();
+  regenControllers.set(g.key, controller);
   regenBusy[g.key] = true;
   try {
-    const msg = await store.genCommitMessage(props.repoId, undefined, [...g.files]);
+    const msg = await store.genCommitMessage(
+      props.repoId,
+      undefined,
+      [...g.files],
+      controller.signal,
+    );
     applyMessageToGroup(g, msg);
   } catch {
+    if (controller.signal.aborted) return;
     toast.error(t("repo.smartCommit.regenFailed"));
   } finally {
+    if (regenControllers.get(g.key) === controller) regenControllers.delete(g.key);
     regenBusy[g.key] = false;
   }
 }
@@ -476,6 +510,10 @@ async function execute(sync: boolean): Promise<void> {
         <div v-if="loading" class="flex flex-col items-center justify-center gap-3 py-12 text-muted-foreground">
           <Loader2 :size="28" class="animate-spin text-primary" />
           <span class="text-sm">{{ $t("repo.smartCommit.generating") }}</span>
+          <Button variant="secondary" size="sm" @click="stopGenerating">
+            <Square :size="13" />
+            <span>{{ $t("repo.smartCommit.stopGenerating") }}</span>
+          </Button>
         </div>
 
         <!-- error -->
