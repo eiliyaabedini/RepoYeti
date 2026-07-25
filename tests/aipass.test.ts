@@ -36,9 +36,10 @@ class MemoryStore implements AiPassSecretStore {
     return true;
   }
 
-  async delete(): Promise<void> {
+  async delete(): Promise<boolean> {
     this.clears++;
     this.value = null;
+    return true;
   }
 }
 
@@ -103,11 +104,13 @@ test("authorization uses discovered endpoints, strong state, and PKCE S256 witho
 test("callback validates userinfo and models before atomically storing a token bundle", async () => {
   const store = new MemoryStore();
   let tokenBody: Record<string, unknown> | null = null;
+  const redirectModes: Array<RequestRedirect | undefined> = [];
   const client = createAiPassClient({
     clientId: () => "protected-test-client",
     store,
     now: () => 1_000,
     fetchImpl: async (input, init) => {
+      redirectModes.push(init?.redirect);
       const url = String(input);
       if (url.endsWith("/.well-known/oauth-authorization-server")) return json(METADATA);
       if (url === METADATA.token_endpoint) {
@@ -152,6 +155,7 @@ test("callback validates userinfo and models before atomically storing a token b
   expect(result).toEqual({
     models: [{ id: "live-chat", label: "Live Chat" }],
   });
+  expect(redirectModes).toEqual(["error", "error", "error", "error"]);
   expect(JSON.stringify(result)).not.toContain("sensitive");
 
   await expect(
@@ -188,6 +192,180 @@ test("callback fails closed when native secret storage cannot persist the tokens
   expect(store.value).toBeNull();
 });
 
+test("callback revokes both halves of an unpersisted grant when verification fails", async () => {
+  const store = new MemoryStore();
+  const revoked: Array<{ token: string; hint: string }> = [];
+  const client = createAiPassClient({
+    clientId: () => "protected-test-client",
+    store,
+    fetchImpl: async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/.well-known/oauth-authorization-server")) return json(METADATA);
+      if (url === METADATA.token_endpoint) {
+        return json({
+          access_token: "unpersisted-access",
+          refresh_token: "unpersisted-refresh",
+        });
+      }
+      if (url === METADATA.userinfo_endpoint) {
+        return json({ error: "temporarily unavailable" }, 503);
+      }
+      if (url === METADATA.revocation_endpoint) {
+        const body = new URLSearchParams(String(init?.body));
+        revoked.push({
+          token: body.get("token") ?? "",
+          hint: body.get("token_type_hint") ?? "",
+        });
+        return new Response(null, { status: 200 });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    },
+  });
+  const authorization = new URL(await client.beginAuthorization("https://app.example.test"));
+
+  await expect(
+    client.completeAuthorization(
+      "one-time-code",
+      authorization.searchParams.get("state")!,
+    ),
+  ).rejects.toThrow("account verification");
+
+  expect(store.writes).toHaveLength(0);
+  expect(store.value).toBeNull();
+  expect(revoked).toEqual([
+    { token: "unpersisted-refresh", hint: "refresh_token" },
+    { token: "unpersisted-access", hint: "access_token" },
+  ]);
+});
+
+test("callback rejects invalid userinfo before storing the grant", async () => {
+  const store = new MemoryStore();
+  const revokedHints: string[] = [];
+  let modelRequests = 0;
+  const client = createAiPassClient({
+    clientId: () => "protected-test-client",
+    store,
+    fetchImpl: async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/.well-known/oauth-authorization-server")) return json(METADATA);
+      if (url === METADATA.token_endpoint) {
+        return json({
+          access_token: "unpersisted-access",
+          refresh_token: "unpersisted-refresh",
+        });
+      }
+      if (url === METADATA.userinfo_endpoint) return json({});
+      if (url.includes("/oauth2/v1/models")) {
+        modelRequests++;
+        return json(["live-chat"]);
+      }
+      if (url === METADATA.revocation_endpoint) {
+        revokedHints.push(
+          new URLSearchParams(String(init?.body)).get("token_type_hint") ?? "",
+        );
+        return new Response(null, { status: 200 });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    },
+  });
+  const authorization = new URL(await client.beginAuthorization("https://app.example.test"));
+
+  await expect(
+    client.completeAuthorization(
+      "one-time-code",
+      authorization.searchParams.get("state")!,
+    ),
+  ).rejects.toThrow("invalid account information");
+
+  expect(modelRequests).toBe(0);
+  expect(store.writes).toHaveLength(0);
+  expect(revokedHints).toEqual(["refresh_token", "access_token"]);
+});
+
+test("callback rejects an unrecognized live-model envelope before storing the grant", async () => {
+  const store = new MemoryStore();
+  const revokedHints: string[] = [];
+  const client = createAiPassClient({
+    clientId: () => "protected-test-client",
+    store,
+    fetchImpl: async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/.well-known/oauth-authorization-server")) return json(METADATA);
+      if (url === METADATA.token_endpoint) {
+        return json({
+          access_token: "unpersisted-access",
+          refresh_token: "unpersisted-refresh",
+        });
+      }
+      if (url === METADATA.userinfo_endpoint) return json({ sub: "account-1" });
+      if (url.includes("/oauth2/v1/models")) {
+        return json({
+          object: "unexpected",
+          data: [{ id: "not-a-validated-model", methods: ["chat_completions"] }],
+        });
+      }
+      if (url === METADATA.revocation_endpoint) {
+        revokedHints.push(
+          new URLSearchParams(String(init?.body)).get("token_type_hint") ?? "",
+        );
+        return new Response(null, { status: 200 });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    },
+  });
+  const authorization = new URL(await client.beginAuthorization("https://app.example.test"));
+
+  await expect(
+    client.completeAuthorization(
+      "one-time-code",
+      authorization.searchParams.get("state")!,
+    ),
+  ).rejects.toThrow("model discovery response");
+
+  expect(store.writes).toHaveLength(0);
+  expect(revokedHints).toEqual(["refresh_token", "access_token"]);
+});
+
+test("callback refuses a non-refreshable grant and revokes its access token", async () => {
+  const store = new MemoryStore();
+  const revokedHints: string[] = [];
+  let userinfoRequests = 0;
+  const client = createAiPassClient({
+    clientId: () => "protected-test-client",
+    store,
+    fetchImpl: async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/.well-known/oauth-authorization-server")) return json(METADATA);
+      if (url === METADATA.token_endpoint) {
+        return json({ access_token: "access-without-refresh", expires_in: 600 });
+      }
+      if (url === METADATA.userinfo_endpoint) {
+        userinfoRequests++;
+        return json({ sub: "account-1" });
+      }
+      if (url === METADATA.revocation_endpoint) {
+        revokedHints.push(
+          new URLSearchParams(String(init?.body)).get("token_type_hint") ?? "",
+        );
+        return new Response(null, { status: 200 });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    },
+  });
+  const authorization = new URL(await client.beginAuthorization("https://app.example.test"));
+
+  await expect(
+    client.completeAuthorization(
+      "one-time-code",
+      authorization.searchParams.get("state")!,
+    ),
+  ).rejects.toThrow("refresh token");
+
+  expect(userinfoRequests).toBe(0);
+  expect(store.writes).toHaveLength(0);
+  expect(revokedHints).toEqual(["access_token"]);
+});
+
 test("refresh rotation is one atomic bundle write before the retried wallet request", async () => {
   const store = new MemoryStore();
   const old: AiPassTokenBundle = {
@@ -197,6 +375,7 @@ test("refresh rotation is one atomic bundle write before the retried wallet requ
   };
   store.value = JSON.stringify(old);
   const order: string[] = [];
+  const redirectModes: Array<RequestRedirect | undefined> = [];
   const client = createAiPassClient({
     clientId: () => "protected-test-client",
     store: {
@@ -209,6 +388,7 @@ test("refresh rotation is one atomic bundle write before the retried wallet requ
     },
     now: () => 100_000,
     fetchImpl: async (input, init) => {
+      redirectModes.push(init?.redirect);
       const url = String(input);
       if (url.endsWith("/.well-known/oauth-authorization-server")) return json(METADATA);
       if (url === METADATA.token_endpoint) {
@@ -244,11 +424,63 @@ test("refresh rotation is one atomic bundle write before the retried wallet requ
 
   expect(text).toBe("feat: rotate safely");
   expect(order).toEqual(["persist-rotation", "wallet-request"]);
+  expect(redirectModes).toEqual(["error", "error", "error"]);
   expect(store.writes).toHaveLength(1);
   expect(JSON.parse(store.writes[0]!)).toMatchObject({
     accessToken: "rotated-access",
     refreshToken: "rotated-refresh",
   });
+});
+
+test("refresh retries one explicit AI Pass rotation conflict without duplicating wallet work", async () => {
+  const store = new MemoryStore();
+  store.value = JSON.stringify({
+    accessToken: "expired-access",
+    refreshToken: "old-refresh",
+    expiresAt: 1,
+  } satisfies AiPassTokenBundle);
+  let refreshRequests = 0;
+  let walletRequests = 0;
+  const client = createAiPassClient({
+    clientId: () => "protected-test-client",
+    store,
+    now: () => 100_000,
+    fetchImpl: async (input) => {
+      const url = String(input);
+      if (url.endsWith("/.well-known/oauth-authorization-server")) return json(METADATA);
+      if (url === METADATA.token_endpoint) {
+        refreshRequests++;
+        if (refreshRequests === 1) {
+          return new Response(JSON.stringify({ error: "rotation in progress" }), {
+            status: 503,
+            headers: {
+              "content-type": "application/json",
+              "retry-after": "0",
+            },
+          });
+        }
+        return json({
+          access_token: "rotated-access",
+          refresh_token: "rotated-refresh",
+          expires_in: 600,
+        });
+      }
+      if (url.endsWith("/oauth2/v1/chat/completions")) {
+        walletRequests++;
+        return sse([
+          'data: {"choices":[{"delta":{"content":"feat: retry refresh"}}]}\n\n',
+          "data: [DONE]\n\n",
+        ]);
+      }
+      throw new Error(`unexpected request: ${url}`);
+    },
+  });
+
+  expect(
+    await client.streamCompletion({ model: "live-chat", messages: [] }),
+  ).toBe("feat: retry refresh");
+  expect(refreshRequests).toBe(2);
+  expect(walletRequests).toBe(1);
 });
 
 test("refresh rotation clears stale credentials when the native-store replacement fails", async () => {
@@ -260,11 +492,12 @@ test("refresh rotation clears stale credentials when the native-store replacemen
   } satisfies AiPassTokenBundle);
   store.allowWrite = false;
   let walletRequests = 0;
+  const revoked: Array<{ token: string; hint: string }> = [];
   const client = createAiPassClient({
     clientId: () => "protected-test-client",
     store,
     now: () => 100_000,
-    fetchImpl: async (input) => {
+    fetchImpl: async (input, init) => {
       const url = String(input);
       if (url.endsWith("/.well-known/oauth-authorization-server")) return json(METADATA);
       if (url === METADATA.token_endpoint) {
@@ -278,6 +511,14 @@ test("refresh rotation clears stale credentials when the native-store replacemen
         walletRequests++;
         return sse(["data: [DONE]\n\n"]);
       }
+      if (url === METADATA.revocation_endpoint) {
+        const body = new URLSearchParams(String(init?.body));
+        revoked.push({
+          token: body.get("token") ?? "",
+          hint: body.get("token_type_hint") ?? "",
+        });
+        return new Response(null, { status: 200 });
+      }
       throw new Error(`unexpected request: ${url}`);
     },
   });
@@ -288,6 +529,359 @@ test("refresh rotation clears stale credentials when the native-store replacemen
   expect(walletRequests).toBe(0);
   expect(store.value).toBeNull();
   expect(store.clears).toBe(1);
+  expect(revoked).toEqual([
+    { token: "rotated-refresh", hint: "refresh_token" },
+    { token: "rotated-access", hint: "access_token" },
+    { token: "old-refresh", hint: "refresh_token" },
+    { token: "expired-access", hint: "access_token" },
+  ]);
+});
+
+test("refresh fails closed when AI Pass omits the rotated refresh token", async () => {
+  const store = new MemoryStore();
+  store.value = JSON.stringify({
+    accessToken: "expired-access",
+    refreshToken: "old-refresh",
+    expiresAt: 1,
+  } satisfies AiPassTokenBundle);
+  let walletRequests = 0;
+  const revoked: Array<{ token: string; hint: string }> = [];
+  const client = createAiPassClient({
+    clientId: () => "protected-test-client",
+    store,
+    now: () => 100_000,
+    fetchImpl: async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/.well-known/oauth-authorization-server")) return json(METADATA);
+      if (url === METADATA.token_endpoint) {
+        return json({ access_token: "rotated-access", expires_in: 600 });
+      }
+      if (url.endsWith("/oauth2/v1/chat/completions")) {
+        walletRequests++;
+        return sse(["data: [DONE]\n\n"]);
+      }
+      if (url === METADATA.revocation_endpoint) {
+        const body = new URLSearchParams(String(init?.body));
+        revoked.push({
+          token: body.get("token") ?? "",
+          hint: body.get("token_type_hint") ?? "",
+        });
+        return new Response(null, { status: 200 });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    },
+  });
+
+  await expect(
+    client.streamCompletion({ model: "live-chat", messages: [] }),
+  ).rejects.toThrow("refresh token");
+  expect(walletRequests).toBe(0);
+  expect(store.value).toBeNull();
+  expect(revoked).toEqual([
+    { token: "rotated-access", hint: "access_token" },
+    { token: "old-refresh", hint: "refresh_token" },
+    { token: "expired-access", hint: "access_token" },
+  ]);
+});
+
+test("a rejected fresh token refreshes once and retries the wallet request once", async () => {
+  const store = new MemoryStore();
+  store.value = JSON.stringify({
+    accessToken: "rejected-access",
+    refreshToken: "current-refresh",
+    expiresAt: 200_000,
+  } satisfies AiPassTokenBundle);
+  let refreshRequests = 0;
+  let chatRequests = 0;
+  const client = createAiPassClient({
+    clientId: () => "protected-test-client",
+    store,
+    now: () => 100_000,
+    fetchImpl: async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/.well-known/oauth-authorization-server")) return json(METADATA);
+      if (url === METADATA.token_endpoint) {
+        refreshRequests++;
+        return json({
+          access_token: "rotated-access",
+          refresh_token: "rotated-refresh",
+          expires_in: 600,
+        });
+      }
+      if (url.endsWith("/oauth2/v1/chat/completions")) {
+        chatRequests++;
+        if (init?.headers && (init.headers as Record<string, string>).authorization === "Bearer rejected-access") {
+          return json({ error: "expired" }, 401);
+        }
+        return sse([
+          'data: {"choices":[{"delta":{"content":"feat: refreshed once"}}]}\n\n',
+          "data: [DONE]\n\n",
+        ]);
+      }
+      throw new Error(`unexpected request: ${url}`);
+    },
+  });
+
+  expect(
+    await client.streamCompletion({ model: "live-chat", messages: [] }),
+  ).toBe("feat: refreshed once");
+  expect(refreshRequests).toBe(1);
+  expect(chatRequests).toBe(2);
+});
+
+test("a proactively refreshed token rejected by AI Pass is cleared without rotating twice", async () => {
+  const store = new MemoryStore();
+  store.value = JSON.stringify({
+    accessToken: "expired-access",
+    refreshToken: "old-refresh",
+    expiresAt: 1,
+  } satisfies AiPassTokenBundle);
+  let refreshRequests = 0;
+  let chatRequests = 0;
+  const revokedHints: string[] = [];
+  const client = createAiPassClient({
+    clientId: () => "protected-test-client",
+    store,
+    now: () => 100_000,
+    fetchImpl: async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/.well-known/oauth-authorization-server")) return json(METADATA);
+      if (url === METADATA.token_endpoint) {
+        refreshRequests++;
+        return json({
+          access_token: `rotated-access-${refreshRequests}`,
+          refresh_token: `rotated-refresh-${refreshRequests}`,
+          expires_in: 600,
+        });
+      }
+      if (url.endsWith("/oauth2/v1/chat/completions")) {
+        chatRequests++;
+        return json({ error: "rejected" }, 401);
+      }
+      if (url === METADATA.revocation_endpoint) {
+        revokedHints.push(
+          new URLSearchParams(String(init?.body)).get("token_type_hint") ?? "",
+        );
+        return new Response(null, { status: 200 });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    },
+  });
+
+  await expect(
+    client.streamCompletion({ model: "live-chat", messages: [] }),
+  ).rejects.toThrow("authorization expired");
+  expect(refreshRequests).toBe(1);
+  expect(chatRequests).toBe(1);
+  expect(store.value).toBeNull();
+  expect(revokedHints).toEqual(["refresh_token", "access_token"]);
+});
+
+test("an access-only stored bundle cannot start wallet work", async () => {
+  const store = new MemoryStore();
+  store.value = JSON.stringify({
+    accessToken: "orphaned-access",
+    expiresAt: 200_000,
+  } satisfies AiPassTokenBundle);
+  let walletRequests = 0;
+  const revokedHints: string[] = [];
+  const client = createAiPassClient({
+    clientId: () => "protected-test-client",
+    store,
+    now: () => 100_000,
+    fetchImpl: async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/.well-known/oauth-authorization-server")) return json(METADATA);
+      if (url === METADATA.revocation_endpoint) {
+        revokedHints.push(
+          new URLSearchParams(String(init?.body)).get("token_type_hint") ?? "",
+        );
+        return new Response(null, { status: 200 });
+      }
+      if (url.endsWith("/oauth2/v1/chat/completions")) {
+        walletRequests++;
+        return sse([
+          'data: {"choices":[{"delta":{"content":"must not run"}}]}\n\n',
+          "data: [DONE]\n\n",
+        ]);
+      }
+      throw new Error(`unexpected request: ${url}`);
+    },
+  });
+
+  await expect(
+    client.streamCompletion({ model: "live-chat", messages: [] }),
+  ).rejects.toThrow("authorization expired");
+  expect(walletRequests).toBe(0);
+  expect(store.value).toBeNull();
+  expect(revokedHints).toEqual(["access_token"]);
+});
+
+test("disconnect cannot be undone by an in-flight refresh or followed by wallet work", async () => {
+  const store = new MemoryStore();
+  store.value = JSON.stringify({
+    accessToken: "expired-access",
+    refreshToken: "old-refresh",
+    expiresAt: 1,
+  } satisfies AiPassTokenBundle);
+  let resolveRefresh!: (response: Response) => void;
+  let markRefreshStarted!: () => void;
+  const refreshStarted = new Promise<void>((resolve) => {
+    markRefreshStarted = resolve;
+  });
+  const revoked: Array<{ token: string; hint: string }> = [];
+  let walletRequests = 0;
+  const client = createAiPassClient({
+    clientId: () => "protected-test-client",
+    store,
+    now: () => 100_000,
+    fetchImpl: async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/.well-known/oauth-authorization-server")) return json(METADATA);
+      if (url === METADATA.token_endpoint) {
+        markRefreshStarted();
+        return await new Promise<Response>((resolve) => {
+          resolveRefresh = resolve;
+        });
+      }
+      if (url === METADATA.revocation_endpoint) {
+        const body = new URLSearchParams(String(init?.body));
+        revoked.push({
+          token: body.get("token") ?? "",
+          hint: body.get("token_type_hint") ?? "",
+        });
+        return new Response(null, { status: 200 });
+      }
+      if (url.endsWith("/oauth2/v1/chat/completions")) {
+        walletRequests++;
+        return sse([
+          'data: {"choices":[{"delta":{"content":"must not run"}}]}\n\n',
+          "data: [DONE]\n\n",
+        ]);
+      }
+      throw new Error(`unexpected request: ${url}`);
+    },
+  });
+
+  const completion = client.streamCompletion({ model: "live-chat", messages: [] });
+  await refreshStarted;
+  const disconnecting = client.disconnect();
+  await Promise.resolve();
+  resolveRefresh(
+    json({
+      access_token: "rotated-access",
+      refresh_token: "rotated-refresh",
+      expires_in: 600,
+    }),
+  );
+
+  expect(await disconnecting).toEqual({ revoked: true });
+  await expect(completion).rejects.toThrow("disconnected");
+  expect(walletRequests).toBe(0);
+  expect(store.value).toBeNull();
+  expect(revoked).toEqual([
+    { token: "rotated-refresh", hint: "refresh_token" },
+    { token: "rotated-access", hint: "access_token" },
+  ]);
+});
+
+test("disconnect fails closed when the secure store does not actually clear", async () => {
+  const store = new MemoryStore();
+  store.value = JSON.stringify({
+    accessToken: "access-sensitive",
+    refreshToken: "refresh-sensitive",
+  } satisfies AiPassTokenBundle);
+  store.delete = async () => {
+    store.clears++;
+    // Simulate a credential backend that reports no exception but retains the item.
+    return false;
+  };
+  let walletRequests = 0;
+  const client = createAiPassClient({
+    clientId: () => "protected-test-client",
+    store,
+    fetchImpl: async (input) => {
+      const url = String(input);
+      if (url.endsWith("/.well-known/oauth-authorization-server")) return json(METADATA);
+      if (url === METADATA.revocation_endpoint) return new Response(null, { status: 200 });
+      if (url.endsWith("/oauth2/v1/chat/completions")) {
+        walletRequests++;
+        return sse([
+          'data: {"choices":[{"delta":{"content":"must not run"}}]}\n\n',
+          "data: [DONE]\n\n",
+        ]);
+      }
+      throw new Error(`unexpected request: ${url}`);
+    },
+  });
+
+  await expect(client.disconnect()).rejects.toThrow("secure storage");
+  await expect(
+    client.streamCompletion({ model: "live-chat", messages: [] }),
+  ).rejects.toThrow("disconnected");
+  expect(walletRequests).toBe(0);
+  expect(store.value).not.toContain("sensitive");
+});
+
+test("a failed disconnect remains blocked after the AI Pass client is recreated", async () => {
+  const store = new MemoryStore();
+  store.value = JSON.stringify({
+    accessToken: "retained-access",
+    refreshToken: "retained-refresh",
+  } satisfies AiPassTokenBundle);
+  store.allowWrite = false;
+  store.delete = async () => {
+    store.clears++;
+    return false;
+  };
+  const blockStore = {
+    value: false,
+    get() {
+      return this.value;
+    },
+    set(value: boolean) {
+      this.value = value;
+      return true;
+    },
+  };
+  const clientOptions = {
+    clientId: () => "protected-test-client",
+    store,
+    blockStore,
+  };
+  const first = createAiPassClient({
+    ...clientOptions,
+    fetchImpl: async (input) => {
+      const url = String(input);
+      if (url.endsWith("/.well-known/oauth-authorization-server")) return json(METADATA);
+      if (url === METADATA.revocation_endpoint) return new Response(null, { status: 503 });
+      throw new Error(`unexpected request: ${url}`);
+    },
+  });
+
+  await expect(first.disconnect()).rejects.toThrow("secure storage");
+
+  let walletRequests = 0;
+  const recreated = createAiPassClient({
+    ...clientOptions,
+    fetchImpl: async (input) => {
+      if (String(input).endsWith("/oauth2/v1/chat/completions")) {
+        walletRequests++;
+        return sse([
+          'data: {"choices":[{"delta":{"content":"must not run"}}]}\n\n',
+          "data: [DONE]\n\n",
+        ]);
+      }
+      throw new Error(`unexpected request: ${String(input)}`);
+    },
+  });
+
+  await expect(
+    recreated.streamCompletion({ model: "live-chat", messages: [] }),
+  ).rejects.toThrow("disconnected");
+  expect(walletRequests).toBe(0);
+  expect(blockStore.value).toBe(true);
+  expect(store.value).toContain("retained-access");
 });
 
 test("cancelling a completion aborts the upstream wallet-billed request", async () => {

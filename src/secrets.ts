@@ -117,15 +117,24 @@ export async function setSecret(name: string, value: string): Promise<boolean> {
   }
 }
 
-/** Remove a secret. Best-effort: a failure is warned once and otherwise ignored. */
-export async function deleteSecret(name: string): Promise<void> {
-  if (disabled()) return;
+/** Remove a secret and report whether the native credential backend confirmed the operation.
+ * Strict account integrations use this instead of claiming a disconnect when the keychain could
+ * not be changed. Legacy call sites keep the best-effort `deleteSecret` wrapper below. */
+export async function deleteSecretStrict(name: string): Promise<boolean> {
+  if (disabled()) return false;
   try {
     await store().delete(service(), name);
     available = true;
+    return true;
   } catch (e) {
     warnOnce("delete", e);
+    return false;
   }
+}
+
+/** Remove a secret. Best-effort: a failure is warned once and otherwise ignored. */
+export async function deleteSecret(name: string): Promise<void> {
+  await deleteSecretStrict(name);
 }
 
 // ── secret-name scheme (one flat namespace under the SERVICE) ──────────────────

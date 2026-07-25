@@ -7,7 +7,16 @@
  * cancellation, and revocation outside the webview.
  */
 import { createHash, randomBytes } from "node:crypto";
-import { AIPASS_TOKEN_BUNDLE, deleteSecret, getSecret, setSecret } from "./secrets.ts";
+import {
+  AIPASS_TOKEN_BUNDLE,
+  deleteSecretStrict,
+  getSecret,
+  setSecret,
+} from "./secrets.ts";
+import {
+  type AiPassBlockStore,
+  nativeAiPassBlockStore,
+} from "./aipass-block.ts";
 import type { AiModel } from "./ai/adapters.ts";
 
 const ISSUER = "https://aipass.one";
@@ -32,6 +41,8 @@ const MAX_CLIENT_ID_CHARS = 512;
 const MAX_TOKEN_CHARS = 64 * 1024;
 const MAX_MODEL_ID_CHARS = 512;
 const MAX_MODEL_LABEL_CHARS = 512;
+const MAX_USER_SUB_CHARS = 1024;
+const MAX_REFRESH_RETRY_MS = 2_000;
 const REFRESH_EARLY_MS = 30_000;
 
 export type AiPassCode =
@@ -65,7 +76,7 @@ export interface AiPassTokenBundle {
 export interface AiPassSecretStore {
   get(): Promise<string | null>;
   set(value: string): Promise<boolean>;
-  delete(): Promise<void>;
+  delete(): Promise<boolean>;
 }
 
 type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
@@ -91,13 +102,15 @@ export interface AiPassClientOptions {
   clientId?: () => string | undefined;
   fetchImpl?: FetchLike;
   store?: AiPassSecretStore;
+  /** Injectable non-secret restart lockout; production uses a marker under RepoYeti's state dir. */
+  blockStore?: AiPassBlockStore;
   now?: () => number;
 }
 
 const nativeStore: AiPassSecretStore = {
   get: () => getSecret(AIPASS_TOKEN_BUNDLE),
   set: (value) => setSecret(AIPASS_TOKEN_BUNDLE, value),
-  delete: () => deleteSecret(AIPASS_TOKEN_BUNDLE),
+  delete: () => deleteSecretStrict(AIPASS_TOKEN_BUNDLE),
 };
 
 function configuredClientId(): string | undefined {
@@ -252,6 +265,24 @@ function statusError(response: Response, context: string): AiPassError {
   return new AiPassError("AI_ERROR", `AI Pass could not complete the ${context}`, 502);
 }
 
+function refreshRetryDelay(response: Response): number {
+  const raw = response.headers.get("retry-after")?.trim() ?? "";
+  const seconds = Number(raw);
+  if (raw && Number.isFinite(seconds) && seconds >= 0) {
+    return Math.min(MAX_REFRESH_RETRY_MS, Math.ceil(seconds * 1000));
+  }
+  const at = Date.parse(raw);
+  if (raw && Number.isFinite(at)) {
+    return Math.min(MAX_REFRESH_RETRY_MS, Math.max(0, at - Date.now()));
+  }
+  return 1_000;
+}
+
+async function waitFor(ms: number): Promise<void> {
+  if (ms <= 0) return;
+  await new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
 function parseMetadata(raw: unknown): Metadata {
   const value = (raw ?? {}) as Record<string, unknown>;
   const metadata: Metadata = {
@@ -331,6 +362,13 @@ export function parseAiPassModels(raw: unknown): AiModel[] {
   return models;
 }
 
+function isAiPassModelsPayload(raw: unknown): boolean {
+  if (Array.isArray(raw)) return raw.every((entry) => typeof entry === "string");
+  if (!raw || typeof raw !== "object") return false;
+  const envelope = raw as { object?: unknown; data?: unknown };
+  return envelope.object === "list" && Array.isArray(envelope.data);
+}
+
 function completionDelta(raw: unknown): string {
   const choice = (raw as { choices?: Array<Record<string, unknown>> } | null)?.choices?.[0];
   const delta = choice?.delta as { content?: unknown } | undefined;
@@ -341,10 +379,81 @@ export function createAiPassClient(options: AiPassClientOptions = {}) {
   const clientIdFor = options.clientId ?? configuredClientId;
   const fetchImpl = options.fetchImpl ?? fetch;
   const store = options.store ?? nativeStore;
+  const blockStore =
+    options.blockStore ??
+    (options.store
+      ? (() => {
+          let blocked = false;
+          return {
+            get: () => blocked,
+            set: (value: boolean) => {
+              blocked = value;
+              return true;
+            },
+          } satisfies AiPassBlockStore;
+        })()
+      : nativeAiPassBlockStore);
   const now = options.now ?? Date.now;
   const transactions = new Map<string, Transaction>();
   let metadataCache: Metadata | null = null;
   let refreshPromise: Promise<AiPassTokenBundle> | null = null;
+  let disconnectPromise: Promise<{ revoked: boolean }> | null = null;
+  let disconnecting = false;
+  let credentialBlocked = blockStore.get();
+  let credentialEpoch = 0;
+  let credentialAbort = new AbortController();
+  let credentialMutationTail = Promise.resolve();
+
+  const disconnectedError = (): AiPassError =>
+    new AiPassError("NOT_CONFIGURED", "AI Pass was disconnected", 404);
+
+  const blockCredentials = (): void => {
+    credentialBlocked = true;
+    blockStore.set(true);
+  };
+
+  const unblockCredentials = (): void => {
+    if (!blockStore.set(false)) {
+      throw new AiPassError(
+        "NOT_CONFIGURED",
+        "AI Pass credential lockout could not be cleared from local state",
+      );
+    }
+    credentialBlocked = false;
+  };
+
+  /** Invalidate every request using the prior credential generation and abort active streams. */
+  const rotateCredentialEpoch = (): number => {
+    credentialEpoch++;
+    credentialAbort.abort(disconnectedError());
+    credentialAbort = new AbortController();
+    return credentialEpoch;
+  };
+
+  /** Serialize secure-store mutations across refresh, callback completion, and disconnect. */
+  const withCredentialMutation = async <T>(operation: () => Promise<T>): Promise<T> => {
+    const previous = credentialMutationTail;
+    let release!: () => void;
+    credentialMutationTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  };
+
+  const requireActiveEpoch = (epoch: number, allowBlocked = false): void => {
+    if (
+      disconnecting ||
+      (!allowBlocked && credentialBlocked) ||
+      epoch !== credentialEpoch
+    ) {
+      throw disconnectedError();
+    }
+  };
 
   const clientId = (): string => {
     const value = clientIdFor()?.trim();
@@ -365,7 +474,11 @@ export function createAiPassClient(options: AiPassClientOptions = {}) {
   ): Promise<{ response: Response; json: unknown }> => {
     const scope = abortScope(init.signal ?? undefined, timeoutMs);
     try {
-      const response = await fetchImpl(url, { ...init, signal: scope.signal });
+      const response = await fetchImpl(url, {
+        ...init,
+        redirect: "error",
+        signal: scope.signal,
+      });
       const body = await boundedJson(response, maxBytes);
       return { response, json: body };
     } catch (error) {
@@ -400,6 +513,40 @@ export function createAiPassClient(options: AiPassClientOptions = {}) {
     }
   };
 
+  const clearTokens = async (): Promise<void> => {
+    let deleted = false;
+    try {
+      deleted = await store.delete();
+    } catch {
+      deleted = false;
+    }
+    let remaining: string | null;
+    try {
+      remaining = await store.get();
+    } catch {
+      throw new AiPassError(
+        "NOT_CONFIGURED",
+        "AI Pass credential removal could not be verified in native secure storage",
+      );
+    }
+    if (!deleted || remaining !== null) {
+      // A backend may fail deletion yet still allow replacement. Overwrite any retained bearer
+      // bundle with a non-secret tombstone so a daemon restart also fails closed. We still report
+      // the deletion failure because the native credential record itself remains.
+      try {
+        if (await store.set("{}")) remaining = await store.get();
+      } catch {
+        /* the strict failure below remains authoritative */
+      }
+    }
+    if (!deleted || remaining !== null) {
+      throw new AiPassError(
+        "NOT_CONFIGURED",
+        "AI Pass credentials could not be cleared from native secure storage",
+      );
+    }
+  };
+
   const revokeOne = async (
     endpoint: string,
     id: string,
@@ -417,6 +564,7 @@ export function createAiPassClient(options: AiPassClientOptions = {}) {
             accept: "application/json",
           },
           body,
+          redirect: "error",
           signal: scope.signal,
         });
         await boundedText(response, MAX_ERROR_BYTES);
@@ -429,9 +577,51 @@ export function createAiPassClient(options: AiPassClientOptions = {}) {
     }
   };
 
+  const revokeBundle = async (
+    endpoint: string,
+    id: string,
+    tokens: AiPassTokenBundle,
+  ): Promise<boolean> => {
+    let revoked = true;
+    if (tokens.refreshToken) {
+      revoked =
+        (await revokeOne(endpoint, id, tokens.refreshToken, "refresh_token")) && revoked;
+    }
+    revoked =
+      (await revokeOne(endpoint, id, tokens.accessToken, "access_token")) && revoked;
+    return revoked;
+  };
+
+  const revokeQuietly = async (
+    doc: Metadata,
+    id: string,
+    tokens: AiPassTokenBundle,
+  ): Promise<void> => {
+    await revokeBundle(doc.revocation_endpoint, id, tokens);
+  };
+
+  const validateTokenGrant = (value: Record<string, unknown>): void => {
+    const returnedTokenType =
+      typeof value.token_type === "string" ? value.token_type.trim() : "";
+    if (returnedTokenType && returnedTokenType.toLowerCase() !== "bearer") {
+      throw new AiPassError("AI_ERROR", "AI Pass returned an unsupported token type", 502);
+    }
+    if (typeof value.scope === "string") {
+      const granted = new Set(value.scope.split(/\s+/).filter(Boolean));
+      if (!SCOPES.split(" ").every((scope) => granted.has(scope))) {
+        throw new AiPassError(
+          "AI_AUTH_FAILED",
+          "AI Pass did not grant the required account permissions",
+          403,
+        );
+      }
+    }
+  };
+
   const refresh = async (): Promise<AiPassTokenBundle> => {
+    if (disconnecting || credentialBlocked) throw disconnectedError();
     if (refreshPromise) return refreshPromise;
-    refreshPromise = (async () => {
+    refreshPromise = withCredentialMutation(async () => {
       const previous = await loadTokens();
       if (!previous?.refreshToken) {
         throw new AiPassError(
@@ -441,38 +631,64 @@ export function createAiPassClient(options: AiPassClientOptions = {}) {
         );
       }
       const doc = await metadata();
-      const { response, json } = await request(
-        doc.token_endpoint,
-        {
-          method: "POST",
-          headers: { "content-type": "application/json", accept: "application/json" },
-          body: JSON.stringify({
-            grantType: "refresh_token",
-            refreshToken: previous.refreshToken,
-            clientId: clientId(),
-          }),
-        },
-        MAX_TOKEN_BYTES,
-      );
+      const id = clientId();
+      const refreshBody = JSON.stringify({
+        grantType: "refresh_token",
+        refreshToken: previous.refreshToken,
+        clientId: id,
+      });
+      const sendRefresh = () =>
+        request(
+          doc.token_endpoint,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json", accept: "application/json" },
+            body: refreshBody,
+          },
+          MAX_TOKEN_BYTES,
+        );
+      let result = await sendRefresh();
+      if (result.response.status === 503) {
+        // AI Pass may serialize server-side rotations and explicitly asks clients to retry one
+        // short conflict. This is the refresh grant only—not a second wallet-billed model call.
+        await waitFor(refreshRetryDelay(result.response));
+        if (disconnecting) throw disconnectedError();
+        result = await sendRefresh();
+      }
+      const { response, json } = result;
       if (!response.ok) {
-        if (response.status === 400 || response.status === 401) await store.delete();
+        if (response.status === 400 || response.status === 401) {
+          blockCredentials();
+          await revokeQuietly(doc, id, previous);
+          await clearTokens();
+        }
         throw statusError(response, "token refresh");
       }
       const value = (json ?? {}) as Record<string, unknown>;
       const accessToken =
         typeof value.access_token === "string" ? value.access_token : "";
-      if (!accessToken || accessToken.length > MAX_TOKEN_CHARS) {
-        throw new AiPassError("AI_ERROR", "AI Pass returned no access token", 502);
-      }
       const returnedRefresh =
         typeof value.refresh_token === "string" ? value.refresh_token : "";
-      if (returnedRefresh.length > MAX_TOKEN_CHARS) {
+      if (!accessToken || accessToken.length > MAX_TOKEN_CHARS) {
+        blockCredentials();
+        if (returnedRefresh && returnedRefresh.length <= MAX_TOKEN_CHARS) {
+          await revokeOne(doc.revocation_endpoint, id, returnedRefresh, "refresh_token");
+        }
+        await revokeQuietly(doc, id, previous);
+        await clearTokens();
+        throw new AiPassError("AI_ERROR", "AI Pass returned no access token", 502);
+      }
+      if (!returnedRefresh || returnedRefresh.length > MAX_TOKEN_CHARS) {
+        blockCredentials();
+        await revokeOne(doc.revocation_endpoint, id, accessToken, "access_token");
+        await revokeQuietly(doc, id, previous);
+        await clearTokens();
         throw new AiPassError("AI_ERROR", "AI Pass returned an invalid refresh token", 502);
       }
       const expiresIn = Number(value.expires_in);
       const rotated: AiPassTokenBundle = {
         accessToken,
-        refreshToken: returnedRefresh || previous.refreshToken,
+        refreshToken: returnedRefresh,
         ...(Number.isFinite(expiresIn) && expiresIn > 0
           ? { expiresAt: now() + expiresIn * 1000 }
           : {}),
@@ -480,15 +696,20 @@ export function createAiPassClient(options: AiPassClientOptions = {}) {
       };
       // One native-store replacement makes access + rotated refresh token indivisible.
       try {
+        validateTokenGrant(value);
         await persistTokens(rotated);
       } catch (error) {
         // The provider may already have invalidated the previous refresh token. Keeping that
-        // stale bundle would falsely present the account as connected after rotation failed.
-        await store.delete();
+        // stale bundle—or orphaning the newly issued pair—would falsely present the account as
+        // connected after rotation failed.
+        blockCredentials();
+        await revokeQuietly(doc, id, rotated);
+        await revokeQuietly(doc, id, previous);
+        await clearTokens();
         throw error;
       }
       return rotated;
-    })();
+    });
     try {
       return await refreshPromise;
     } finally {
@@ -496,25 +717,84 @@ export function createAiPassClient(options: AiPassClientOptions = {}) {
     }
   };
 
-  const accessToken = async (): Promise<string> => {
+  const clearActiveTokens = async (epoch: number): Promise<void> => {
+    await withCredentialMutation(async () => {
+      requireActiveEpoch(epoch);
+      blockCredentials();
+      const tokens = await loadTokens();
+      if (tokens) {
+        try {
+          const doc = await metadata();
+          await revokeQuietly(doc, clientId(), tokens);
+        } catch {
+          /* local fail-closed clearing remains mandatory */
+        }
+      }
+      await clearTokens();
+    });
+  };
+
+  const accessToken = async (): Promise<{ token: string; refreshed: boolean }> => {
+    if (disconnecting || credentialBlocked) throw disconnectedError();
     const current = await loadTokens();
     if (!current) {
       throw new AiPassError("NOT_CONFIGURED", "Connect AI Pass before using its wallet", 404);
     }
-    if (current.expiresAt != null && current.expiresAt <= now() + REFRESH_EARLY_MS) {
-      return (await refresh()).accessToken;
+    if (!current.refreshToken) {
+      await withCredentialMutation(async () => {
+        blockCredentials();
+        try {
+          const doc = await metadata();
+          await revokeQuietly(doc, clientId(), current);
+        } catch {
+          /* local fail-closed clearing remains mandatory */
+        }
+        await clearTokens();
+      });
+      throw new AiPassError(
+        "AI_AUTH_FAILED",
+        "AI Pass authorization expired; connect the account again",
+        401,
+      );
     }
-    return current.accessToken;
+    if (refreshPromise) {
+      const refreshed = await refresh();
+      if (disconnecting || credentialBlocked) throw disconnectedError();
+      return { token: refreshed.accessToken, refreshed: true };
+    }
+    if (current.expiresAt != null && current.expiresAt <= now() + REFRESH_EARLY_MS) {
+      const refreshed = await refresh();
+      if (disconnecting || credentialBlocked) throw disconnectedError();
+      return { token: refreshed.accessToken, refreshed: true };
+    }
+    if (disconnecting || credentialBlocked) throw disconnectedError();
+    return { token: current.accessToken, refreshed: false };
   };
 
-  const fetchModels = async (token: string, retry = true): Promise<AiModel[]> => {
+  const fetchModels = async (
+    token: string,
+    retry = true,
+    operationEpoch?: number,
+  ): Promise<AiModel[]> => {
     const { response, json } = await request(
       MODELS_URL,
       { method: "GET", headers: { authorization: `Bearer ${token}`, accept: "application/json" } },
       MAX_MODELS_BYTES,
     );
-    if (response.status === 401 && retry) return fetchModels((await refresh()).accessToken, false);
+    if (response.status === 401 && retry) {
+      return fetchModels((await refresh()).accessToken, false, operationEpoch);
+    }
+    if (response.status === 401 && operationEpoch != null) {
+      await clearActiveTokens(operationEpoch);
+    }
     if (!response.ok) throw statusError(response, "model discovery");
+    if (!isAiPassModelsPayload(json)) {
+      throw new AiPassError(
+        "AI_ERROR",
+        "AI Pass returned an invalid model discovery response",
+        502,
+      );
+    }
     return parseAiPassModels(json);
   };
 
@@ -562,7 +842,9 @@ export function createAiPassClient(options: AiPassClientOptions = {}) {
       throw new AiPassError("AI_BAD_REQUEST", "This AI Pass connection expired; start again");
     }
     if (!code) throw new AiPassError("AI_BAD_REQUEST", "AI Pass returned no authorization code");
+    const operationEpoch = rotateCredentialEpoch();
     const doc = await metadata();
+    const id = clientId();
     const { response, json } = await request(
       doc.token_endpoint,
       {
@@ -572,7 +854,7 @@ export function createAiPassClient(options: AiPassClientOptions = {}) {
           grantType: "authorization_code",
           code,
           codeVerifier: tx.verifier,
-          clientId: clientId(),
+          clientId: id,
           redirectUri: tx.redirectUri,
         }),
       },
@@ -584,9 +866,13 @@ export function createAiPassClient(options: AiPassClientOptions = {}) {
     const refreshToken =
       typeof value.refresh_token === "string" ? value.refresh_token : "";
     if (!access || access.length > MAX_TOKEN_CHARS) {
+      if (refreshToken && refreshToken.length <= MAX_TOKEN_CHARS) {
+        await revokeOne(doc.revocation_endpoint, id, refreshToken, "refresh_token");
+      }
       throw new AiPassError("AI_ERROR", "AI Pass returned no access token", 502);
     }
     if (refreshToken.length > MAX_TOKEN_CHARS) {
+      await revokeOne(doc.revocation_endpoint, id, access, "access_token");
       throw new AiPassError("AI_ERROR", "AI Pass returned an invalid refresh token", 502);
     }
     const expiresIn = Number(value.expires_in);
@@ -599,30 +885,67 @@ export function createAiPassClient(options: AiPassClientOptions = {}) {
       ...(typeof value.token_type === "string" ? { tokenType: value.token_type } : {}),
     };
 
-    const userinfo = await request(
-      doc.userinfo_endpoint,
-      {
-        method: "GET",
-        headers: { authorization: `Bearer ${access}`, accept: "application/json" },
-      },
-      MAX_USERINFO_BYTES,
-    );
-    if (!userinfo.response.ok) throw statusError(userinfo.response, "account verification");
-    // This grant is intentionally not stored until verification succeeds, so a 401 here must
-    // fail the new connection rather than trying to refresh an unrelated prior bundle.
-    const models = await fetchModels(access, false);
+    let stored = false;
     try {
-      await persistTokens(tokens);
-    } catch (error) {
-      // The grant exists but cannot be stored safely. Best-effort revoke both halves, retain none.
-      if (refreshToken) {
-        await revokeOne(doc.revocation_endpoint, clientId(), refreshToken, "refresh_token");
+      if (!refreshToken) {
+        throw new AiPassError(
+          "AI_ERROR",
+          "AI Pass returned no refresh token for this account connection",
+          502,
+        );
       }
-      await revokeOne(doc.revocation_endpoint, clientId(), access, "access_token");
-      await store.delete();
+      validateTokenGrant(value);
+      const userinfo = await request(
+        doc.userinfo_endpoint,
+        {
+          method: "GET",
+          headers: { authorization: `Bearer ${access}`, accept: "application/json" },
+        },
+        MAX_USERINFO_BYTES,
+      );
+      if (!userinfo.response.ok) {
+        throw statusError(userinfo.response, "account verification");
+      }
+      const sub =
+        typeof (userinfo.json as { sub?: unknown } | null)?.sub === "string"
+          ? (userinfo.json as { sub: string }).sub.trim()
+          : "";
+      if (!sub || sub.length > MAX_USER_SUB_CHARS) {
+        throw new AiPassError(
+          "AI_ERROR",
+          "AI Pass returned invalid account information",
+          502,
+        );
+      }
+      // This grant is intentionally not stored until verification and live discovery succeed, so
+      // failures here must revoke the otherwise-orphaned grant instead of refreshing old tokens.
+      const models = await fetchModels(access, false);
+      await withCredentialMutation(async () => {
+        requireActiveEpoch(operationEpoch, true);
+        try {
+          await persistTokens(tokens);
+          // Disconnect may have invalidated this callback while the native write was pending.
+          // Never let a late successful write unblock that newer credential epoch.
+          requireActiveEpoch(operationEpoch, true);
+          unblockCredentials();
+        } catch (error) {
+          // A failed replacement is ambiguous on native backends. Clear rather than retaining a
+          // potentially partial or stale bundle, and never claim that this connection succeeded.
+          blockCredentials();
+          await clearTokens();
+          throw error;
+        }
+      });
+      stored = true;
+      return { models };
+    } catch (error) {
+      if (!stored) {
+        // The code has already been exchanged. Any later verification, discovery, race, or
+        // persistence failure must retire both unpersisted halves of that newly issued grant.
+        await revokeBundle(doc.revocation_endpoint, id, tokens);
+      }
       throw error;
     }
-    return { models };
   };
 
   const streamCompletion = async (
@@ -633,8 +956,15 @@ export function createAiPassClient(options: AiPassClientOptions = {}) {
     if (Buffer.byteLength(requestBody) > MAX_REQUEST_BYTES) {
       throw new AiPassError("AI_BAD_REQUEST", "AI Pass request is too large");
     }
+    const operationEpoch = credentialEpoch;
+    requireActiveEpoch(operationEpoch);
+    const credentialSignal = credentialAbort.signal;
+    const externalSignal = streamOptions.signal;
+    const operationSignal = externalSignal
+      ? AbortSignal.any([externalSignal, credentialSignal])
+      : credentialSignal;
     const scope = abortScope(
-      streamOptions.signal,
+      operationSignal,
       streamOptions.timeoutMs ?? STREAM_TIMEOUT_MS,
     );
     let response: Response | null = null;
@@ -649,15 +979,21 @@ export function createAiPassClient(options: AiPassClientOptions = {}) {
             accept: "text/event-stream",
           },
           body: requestBody,
+          redirect: "error",
           signal: scope.signal,
         });
-      response = await send(await accessToken());
-      if (response.status === 401) {
+      const initialToken = await accessToken();
+      requireActiveEpoch(operationEpoch);
+      response = await send(initialToken.token);
+      if (response.status === 401 && !initialToken.refreshed) {
         await response.body?.cancel();
-        response = await send((await refresh()).accessToken);
+        const refreshed = await refresh();
+        requireActiveEpoch(operationEpoch);
+        response = await send(refreshed.accessToken);
       }
       if (!response.ok) {
         await boundedText(response, MAX_ERROR_BYTES);
+        if (response.status === 401) await clearActiveTokens(operationEpoch);
         throw statusError(response, "wallet request");
       }
       if (
@@ -715,7 +1051,10 @@ export function createAiPassClient(options: AiPassClientOptions = {}) {
       return output;
     } catch (error) {
       if (error instanceof AiPassError) throw error;
-      if (scope.signal.aborted && streamOptions.signal?.aborted) throw error;
+      if (credentialSignal.aborted || operationEpoch !== credentialEpoch) {
+        throw disconnectedError();
+      }
+      if (scope.signal.aborted && externalSignal?.aborted) throw error;
       if (scope.signal.aborted) {
         throw new AiPassError("AI_UNREACHABLE", "AI Pass completion timed out", 504);
       }
@@ -740,43 +1079,50 @@ export function createAiPassClient(options: AiPassClientOptions = {}) {
   };
 
   const disconnect = async (): Promise<{ revoked: boolean }> => {
-    const tokens = await loadTokens();
-    let revoked = true;
-    try {
-      if (tokens) {
-        const doc = await metadata();
-        const id = clientId();
-        if (tokens.refreshToken) {
-          revoked =
-            (await revokeOne(
-              doc.revocation_endpoint,
-              id,
-              tokens.refreshToken,
-              "refresh_token",
-            )) && revoked;
+    if (disconnectPromise) return disconnectPromise;
+    disconnecting = true;
+    blockCredentials();
+    rotateCredentialEpoch();
+    transactions.clear();
+    disconnectPromise = withCredentialMutation(async () => {
+      const tokens = await loadTokens();
+      let revoked = true;
+      try {
+        if (tokens) {
+          const doc = await metadata();
+          revoked = await revokeBundle(doc.revocation_endpoint, clientId(), tokens);
         }
-        revoked =
-          (await revokeOne(
-            doc.revocation_endpoint,
-            id,
-            tokens.accessToken,
-            "access_token",
-          )) && revoked;
+      } catch {
+        revoked = false;
       }
-    } catch {
-      revoked = false;
+      // Clearing is not best-effort: callers must not remove the runtime marker or claim success
+      // when the native credential backend failed to delete the bearer credentials.
+      await clearTokens();
+      return { revoked };
+    });
+    try {
+      return await disconnectPromise;
     } finally {
-      await store.delete();
+      disconnectPromise = null;
+      disconnecting = false;
     }
-    return { revoked };
   };
 
   return {
     beginAuthorization,
     cancelAuthorization,
     completeAuthorization,
-    isConnected: async (): Promise<boolean> => (await loadTokens()) !== null,
-    listModels: async (): Promise<AiModel[]> => fetchModels(await accessToken()),
+    isConnected: async (): Promise<boolean> => {
+      if (credentialBlocked) return false;
+      return Boolean((await loadTokens())?.refreshToken);
+    },
+    listModels: async (): Promise<AiModel[]> => {
+      const operationEpoch = credentialEpoch;
+      requireActiveEpoch(operationEpoch);
+      const access = await accessToken();
+      requireActiveEpoch(operationEpoch);
+      return fetchModels(access.token, !access.refreshed, operationEpoch);
+    },
     streamCompletion,
     disconnect,
   };

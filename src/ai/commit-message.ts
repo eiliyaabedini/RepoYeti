@@ -34,6 +34,9 @@ export type FetchFn = (input: string, init?: RequestInit) => Promise<Response>;
  *  with refresh and cancellation while reusing the existing prompt/request builders. */
 export interface AiGenerationOptions {
   signal?: AbortSignal;
+  /** Existing BYOK plans retry one malformed model reply. Wallet-backed transports disable that
+   *  paid retry and let the caller use its local heuristic fallback instead. */
+  retryMalformed?: boolean;
   streamCompletion?: (
     body: Record<string, unknown>,
     options: { signal?: AbortSignal; timeoutMs: number },

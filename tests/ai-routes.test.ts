@@ -1,7 +1,7 @@
 import { test, expect } from "bun:test";
 import { createApp } from "../src/http/app.ts";
 import type { RepoYetiConfig } from "../src/config.ts";
-import type { AiPassClient } from "../src/aipass.ts";
+import { AiPassError, type AiPassClient } from "../src/aipass.ts";
 
 // Local mode (no OIDC) → /api/* is not gated, so we can exercise the AI routes directly.
 const localCfg = (): RepoYetiConfig => ({ roots: [], port: 7171, maxDepth: 6, maxRepos: 200 });
@@ -188,4 +188,35 @@ test("AI Pass model refresh is live and disconnect revokes before clearing provi
   expect(cfg.ai?.providers.aipass).toBeUndefined();
   expect(cfg.ai?.defaultProvider).toBeUndefined();
   expect(await removed.json()).toMatchObject({ defaultProvider: null });
+});
+
+test("AI Pass disconnect keeps provider state when secure credential clearing fails", async () => {
+  const cfg: RepoYetiConfig = {
+    ...localCfg(),
+    ai: {
+      providers: { aipass: { connected: true, model: "live-wallet-model" } },
+      defaultProvider: "aipass",
+    },
+  };
+  const aiPass = fakeAiPass({
+    disconnect: async () => {
+      throw new AiPassError(
+        "NOT_CONFIGURED",
+        "AI Pass credentials could not be cleared from native secure storage",
+      );
+    },
+  });
+
+  const removed = await createApp(cfg, { aiPass }).request(
+    "/api/ai/providers/aipass",
+    { method: "DELETE" },
+  );
+
+  expect(removed.status).toBe(400);
+  expect(await removed.json()).toMatchObject({ code: "NOT_CONFIGURED" });
+  expect(cfg.ai?.providers.aipass).toEqual({
+    connected: true,
+    model: "live-wallet-model",
+  });
+  expect(cfg.ai?.defaultProvider).toBe("aipass");
 });

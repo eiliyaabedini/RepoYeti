@@ -23,6 +23,7 @@ import {
   AIPASS_TOKEN_BUNDLE,
 } from "./secrets.ts";
 import { publicKeyFor } from "./relay.ts";
+import { nativeAiPassBlockStore } from "./aipass-block.ts";
 
 export const VERSION = "0.13.1";
 
@@ -888,7 +889,7 @@ export async function hydrateSecrets(cfg: RepoYetiConfig): Promise<void> {
   // bundle in the native credential store; config receives only this ephemeral usable marker.
   const aiPassRaw = await getSecret(AIPASS_TOKEN_BUNDLE);
   let aiPassStored = false;
-  if (aiPassRaw) {
+  if (!nativeAiPassBlockStore.get() && aiPassRaw) {
     try {
       const tokens = JSON.parse(aiPassRaw) as { accessToken?: unknown };
       aiPassStored = typeof tokens.accessToken === "string" && tokens.accessToken.length > 0;

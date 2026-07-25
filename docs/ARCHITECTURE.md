@@ -1393,9 +1393,14 @@ The daemon is the OAuth client and authenticated transport boundary:
    `POST https://aipass.one/oauth2/v1/chat/completions` with `stream:true`. The daemon consumes the
    bounded SSE stream and returns only the finished RepoYeti result. Browser abort, modal close, or
    Stop aborts that upstream request so wallet-billed work does not continue invisibly.
-5. Refresh is mutexed. A rotated access/refresh pair replaces the single credential-store bundle
-   before the retried wallet request starts. Disconnect attempts refresh- and access-token
-   revocation, then clears local tokens even if the network is unavailable.
+5. Refresh, callback persistence, and disconnect are serialized. A rotated access/refresh pair
+   replaces the single credential-store bundle before the retried wallet request starts; unusable
+   or unpersisted grants are revoked and never reach wallet work. Disconnect first writes a
+   non-secret fail-closed marker, aborts active streams, attempts refresh- and access-token
+   revocation, and strictly clears local tokens even if the network is unavailable. If a native
+   credential backend cannot confirm deletion or replacement, the marker prevents the retained
+   bundle from becoming usable again after a daemon restart; only a fully verified new OAuth
+   connection removes it.
 
 All discovery/token/userinfo/model/error responses, request bodies, and streams have byte ceilings
 and deadlines. Tokens never enter Vue state, local/session storage, query strings, cookies, config,

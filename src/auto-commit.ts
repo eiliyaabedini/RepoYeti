@@ -234,6 +234,7 @@ async function buildPlan(repoId: string): Promise<BuiltPlan> {
               undefined,
               provider === "aipass"
                 ? {
+                    retryMalformed: false,
                     streamCompletion: (body, options) =>
                       aiPassClient.streamCompletion(body, options),
                   }

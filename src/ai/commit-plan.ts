@@ -404,8 +404,10 @@ export async function generateCommitPlan(
 
   // One retry: models occasionally wrap the JSON in prose or truncate it. A terse second ask
   // ("ONLY the JSON object") recovers most of those before we give up to the heuristic fallback.
+  // Wallet-funded transports opt out: malformed output is still a completed paid request, so the
+  // safe fallback is local rather than silently buying a second completion.
   let plan = await ask(planUserPrompt(input));
-  if (!plan) {
+  if (!plan && options.retryMalformed !== false) {
     plan = await ask(
       planUserPrompt(input) +
         "\n\nIMPORTANT: respond with ONLY the JSON object described above — no prose, no markdown fences.",

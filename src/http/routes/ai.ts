@@ -365,8 +365,11 @@ export function register(app: Hono, { cfg, aiPass }: Deps): void {
     if (provider === "aipass") {
       try {
         disconnected = await aiPass.disconnect();
-      } catch {
-        disconnected = { revoked: false };
+      } catch (error) {
+        // Do not remove the runtime marker or claim a disconnect when native secure storage could
+        // not clear the bearer credentials. A revocation-network failure is represented by
+        // `{ revoked:false }` only after local clearing has definitely succeeded.
+        return aiErr(c, error, provider);
       }
     }
     if (cfg.ai?.providers) delete cfg.ai.providers[provider];
@@ -499,6 +502,7 @@ export function register(app: Hono, { cfg, aiPass }: Deps): void {
           signal: c.req.raw.signal,
           ...(provider === "aipass"
             ? {
+                retryMalformed: false,
                 streamCompletion: (
                   body: Record<string, unknown>,
                   options: { signal?: AbortSignal; timeoutMs: number },

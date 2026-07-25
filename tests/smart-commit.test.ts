@@ -180,6 +180,34 @@ test("generateCommitPlan retries once when the first response is unparseable", a
   expect(plan.groups.length).toBe(1);
 });
 
+test("wallet-backed plan generation can fail over locally without a second paid request", async () => {
+  let calls = 0;
+  const input: CommitPlanInput = {
+    files: [{ path: "a.ts", status: "M", additions: 1, removals: 0, binary: false }],
+    diff: "",
+    truncated: false,
+  };
+
+  const error = await generateCommitPlan(
+    "aipass",
+    "",
+    "live-model",
+    input,
+    "conventional",
+    undefined,
+    {
+      streamCompletion: async () => {
+        calls++;
+        return "not a usable plan";
+      },
+      retryMalformed: false,
+    },
+  ).catch((cause) => cause);
+
+  expect(error).toBeInstanceOf(AiError);
+  expect(calls).toBe(1);
+});
+
 test("plan prompts mention the file-level rule and list every path", () => {
   const input: CommitPlanInput = {
     files: [{ path: "src/x.ts", status: "M", additions: 1, removals: 0, binary: false }],
